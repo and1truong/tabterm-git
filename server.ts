@@ -30,27 +30,25 @@ async function dirExists(p: string): Promise<boolean> {
 }
 
 // A cached root is valid only while no repository boundary changed between the
-// workspace cwd and that root. Walking up from the cwd:
-//   - a `.git` marker appearing closer than the cached root (e.g. `git init`
-//     inside a subdirectory of a parent repository) invalidates the entry;
-//   - reaching the cached root without finding its own marker (repo deleted)
+// workspace cwd and that root (or, for a cached "no repo", anywhere up the
+// tree). Walking up from the cwd:
+//   - the first `.git` marker found must be the cached root itself — a marker
+//     closer to the cwd (nested `git init`) or farther up (ancestor init, e.g.
+//     `git init ..`) invalidates the entry;
+//   - reaching the cached root without its own marker (repo deleted)
 //     invalidates it too.
 // Paths are compared in realpath space: resolveRoot returns a realpath'd root,
 // and symlinked cwds (e.g. /tmp → /private/tmp on macOS) otherwise never meet
 // it as a string prefix.
 async function rootCacheValid(entry: { cwd: string; root: string | null }): Promise<boolean> {
-  if (entry.root === null) {
-    // Cached "no repo": re-resolve once a .git marker appears at the cwd
-    // (stat follows symlinks, so the raw cwd is fine here).
-    return !(await dirExists(joinPath(entry.cwd, ".git")));
-  }
   let start: string;
   try { start = await pathRealpath(entry.cwd); } catch { return false; }
   let p = start;
   const stop = entry.root;
   for (;;) {
-    if (await dirExists(joinPath(p, ".git"))) return p === stop;  // first marker must be the cached root
-    if (p === stop || p === pathDirname(p)) return false;          // root reached without its marker
+    if (await dirExists(joinPath(p, ".git"))) return stop !== null && p === stop;
+    if (stop !== null && p === stop) return false;   // root reached without its marker
+    if (p === pathDirname(p)) return stop === null;  // filesystem root: stale only if a repo was cached
     p = pathDirname(p);
   }
 }
@@ -74,9 +72,11 @@ export default function activate(host: ServerHost) {
   // the cwd moves, the cached root disappears, or a `.git` marker appears
   // closer to the cwd (e.g. `git init` from a terminal).
   const rootCache = new Map<string, { cwd: string; root: string | null }>();
-  // Last successful submodule list per workspace, reused on throttled ticks so
-  // a `git:refs` push never resets the sidebar to an empty submodule list.
-  const cachedSubmodules = new Map<string, Submodule[]>();
+  // Last successful submodule list per workspace, keyed with the root it was
+  // resolved against and reused on throttled ticks so a `git:refs` push never
+  // resets the sidebar to an empty submodule list — and never leaks the
+  // previous repository's list across a root switch.
+  const cachedSubmodules = new Map<string, { root: string; submodules: Submodule[] }>();
 
   const rootFor = async (key: string): Promise<string | null> => {
     const cwd = host.workspaces.get(key)?.cwd;
@@ -99,11 +99,13 @@ export default function activate(host: ServerHost) {
       const refs: GitRefs = { branches: all.branches, remoteBranches: all.remoteBranches, current, remotes, stashes, tags: all.tags, submodules: [], worktrees };
       if (includeSubmodules || (refsTick.get(key) ?? 0) % SUBMODULES_EVERY === 0) {
         refs.submodules = await git.submodules(root);
-        cachedSubmodules.set(key, refs.submodules);
+        cachedSubmodules.set(key, { root, submodules: refs.submodules });
       } else {
-        // Throttled ticks reuse the last successful list instead of resetting
-        // the client to "no submodules" between refresh cycles.
-        refs.submodules = cachedSubmodules.get(key) ?? [];
+        // Throttled ticks reuse the last successful list — but only for the
+        // same root, so a repository-boundary change (e.g. a nested `git init`)
+        // never broadcasts the previous repository's submodules.
+        const cached = cachedSubmodules.get(key);
+        refs.submodules = cached && cached.root === root ? cached.submodules : [];
       }
       return { type: "git:refs", tabId: key, refs };
     } catch (e) {

@@ -206,4 +206,53 @@ describe("git module: root cache detects repository-boundary changes", () => {
     expect(second.snapshot.branch).toBe("main");
     await rm(parent, { recursive: true, force: true });
   });
+
+  test("git init in an ancestor of a cached no-repo workspace switches roots", async () => {
+    const parent = await mkdtemp(join(tmpdir(), "tabterm-ancestor-init-"));
+    const work = join(parent, "work");
+    await mkdir(work);
+    const { host, spec } = fakeHost({ tab1: work });
+    activate(host);
+    const { peer, sent } = captureSends();
+    // Join resolves + caches root: null ("not a repository").
+    await spec().onJoin!(ctxFor("tab1"), peer);
+    expect(sent.some((m) => m.type === "git:noRepo")).toBe(true);
+
+    // An ancestor gains a repository; the next poll must notice it even though
+    // no .git marker exists at the workspace cwd itself.
+    await git(parent, "init", "-q", "-b", "main");
+    const pushed: any[] = [];
+    const ctx = ctxFor("tab1", pushed);
+    await spec().poll!(ctx);
+    const status = pushed.find((m) => m.type === "git:status");
+    expect(status).toBeDefined();
+    expect(status.snapshot.branch).toBe("main");
+    await rm(parent, { recursive: true, force: true });
+  });
+
+  test("submodule cache does not leak across a root switch", async () => {
+    const parent = await makeRepo();
+    const lib = await makeRepo();
+    await git(parent, "-c", "protocol.file.allow=always", "submodule", "add", lib, "vendor/lib");
+    await git(parent, "commit", "-q", "-m", "add submodule");
+    const work = join(parent, "inner");
+    await mkdir(work);
+    const { host, spec } = fakeHost({ tab1: work });
+    activate(host);
+    const { peer } = captureSends();
+    // Eager join caches the PARENT repo's submodule list for this workspace.
+    await spec().onJoin!(ctxFor("tab1"), peer);
+
+    // A nested repo appears at the cwd; the tick-3 refs push must not
+    // broadcast the parent's stale submodule list for the new repository.
+    await git(work, "init", "-q", "-b", "main");
+    const pushed: any[] = [];
+    const ctx = ctxFor("tab1", pushed);
+    for (let i = 0; i < 3; i++) await spec().poll!(ctx);
+    const refsMsg = pushed.find((m) => m.type === "git:refs");
+    expect(refsMsg).toBeDefined();
+    expect(refsMsg.refs.submodules).toEqual([]);
+    await rm(parent, { recursive: true, force: true });
+    await rm(lib, { recursive: true, force: true });
+  });
 });
