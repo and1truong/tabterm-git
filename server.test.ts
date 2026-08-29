@@ -255,4 +255,36 @@ describe("git module: root cache detects repository-boundary changes", () => {
     await rm(parent, { recursive: true, force: true });
     await rm(lib, { recursive: true, force: true });
   });
+
+  test("an in-flight refs refresh is discarded when the root switches", async () => {
+    const parent = await makeRepo();
+    await git(parent, "branch", "keep"); // parent has 2 branches
+    const work = join(parent, "inner");
+    await mkdir(work);
+    const { host, spec } = fakeHost({ tab1: work });
+    activate(host);
+    await spec().poll!(ctxFor("tab1")); // pre-cache the parent root
+
+    const { peer, sent } = captureSends();
+    // Start the eager join (refsMsg incl. submodules) and switch the
+    // repository boundary while its subprocesses are still in flight — the
+    // completed refresh must be discarded, not broadcast for the old root.
+    const joinP = spec().onJoin!(ctxFor("tab1"), peer);
+    await git(work, "init", "-q", "-b", "main");
+    await joinP;
+    expect(sent.filter((m) => m.type === "git:refs")).toEqual([]);
+
+    // The next refs tick recomputes against the new repository.
+    const pushed: any[] = [];
+    const ctx = ctxFor("tab1", pushed);
+    await spec().poll!(ctx); // tick 2
+    await spec().poll!(ctx); // tick 3 → refs push
+    const refsMsg = pushed.find((m) => m.type === "git:refs");
+    expect(refsMsg).toBeDefined();
+    // The fresh repo has no commits yet, so for-each-ref lists no branches —
+    // the parent's ["keep", "main"] would distinguish it if leaked.
+    expect(refsMsg.refs.branches.map((b: any) => b.name).sort()).toEqual([]);
+    expect(refsMsg.refs.submodules).toEqual([]);
+    await rm(parent, { recursive: true, force: true });
+  });
 });

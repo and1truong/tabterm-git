@@ -95,6 +95,11 @@ export default function activate(host: ServerHost) {
       const [all, remotes, stashes, worktrees] = await Promise.all([
         git.refsOf(root), git.remotes(root), git.stashes(root), git.worktrees(root),
       ]);
+      // A repository boundary may have changed (e.g. a terminal `git init`)
+      // while the subprocesses above were running. Discard the result — the
+      // next refs tick recomputes against the new root; broadcasting stale
+      // refs/submodules would flash the previous repository at the client.
+      if ((await rootFor(key)) !== root) return null;
       const current = all.branches.find((b) => b.current)?.name ?? null;
       const refs: GitRefs = { branches: all.branches, remoteBranches: all.remoteBranches, current, remotes, stashes, tags: all.tags, submodules: [], worktrees };
       if (includeSubmodules || (refsTick.get(key) ?? 0) % SUBMODULES_EVERY === 0) {
@@ -137,7 +142,7 @@ export default function activate(host: ServerHost) {
       }
       // Refs are independent of the working tree; push after status so a slow
       // refs refresh (submodule status) never delays the status message.
-      if (t % REFS_EVERY === 0) ctx.push(await refsMsg(ctx.key));
+      if (t % REFS_EVERY === 0) { const refs = await refsMsg(ctx.key); if (refs) ctx.push(refs); }
       return undefined;
     },
     onJoin: async (ctx: RoomContext, peer: Peer) => {
@@ -156,7 +161,8 @@ export default function activate(host: ServerHost) {
       }
       // A fresh join sees submodules immediately; the cadence only throttles
       // the background refreshes.
-      peer.send(await refsMsg(ctx.key, true));
+      const refs = await refsMsg(ctx.key, true);
+      if (refs) peer.send(refs);
     },
     onIdle: (key: string) => { latestStatus.delete(key); lastStatusOut.delete(key); refsTick.delete(key); activeJobs.delete(key); rootCache.delete(key); cachedSubmodules.delete(key); },
     onRequest: async (ctx: RoomContext, msg: any, peer: Peer) => {
@@ -173,7 +179,8 @@ export default function activate(host: ServerHost) {
           latestStatus.set(ctx.key, out.snapshot);
           refsTick.set(ctx.key, 0);
           ctx.push({ type: "git:status", tabId: ctx.key, snapshot: out.snapshot });
-          ctx.push(await refsMsg(ctx.key));
+          const refs = await refsMsg(ctx.key);
+          if (refs) ctx.push(refs);
         } catch (e) {
           err((e as Error).message);
         }
@@ -310,7 +317,7 @@ export default function activate(host: ServerHost) {
           latestStatus.set(ctx.key, out.snapshot);
           ctx.push({ type: "git:status", tabId: ctx.key, snapshot: out.snapshot });
         } catch { /* keep last */ }
-        if (refsChanged) ctx.push(await refsMsg(ctx.key, SUBMODULE_MUTATIONS.has(msg.type)));
+        if (refsChanged) { const refs = await refsMsg(ctx.key, SUBMODULE_MUTATIONS.has(msg.type)); if (refs) ctx.push(refs); }
         }
         if (descriptor) {
           activeJobs.delete(ctx.key);
