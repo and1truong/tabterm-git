@@ -65,8 +65,8 @@ export function GitPanel({ tabId, host }: { tabId: string; host: ClientHost }) {
     return () => { host.send({ type: "git:unsubscribe", tabId }); };
   }, [tabId]);
   useEffect(() => {
-    if (ready) host.send({ type: "git:openCommitContext", tabId });
-  }, [tabId, ready]);
+    if (snapshot) host.send({ type: "git:openCommitContext", tabId });
+  }, [tabId, snapshot?.headSha]);
   useEffect(() => {
     if (snapshot || error) setInitializing(false);
   }, [snapshot, error]);
@@ -243,6 +243,7 @@ export function GitPanel({ tabId, host }: { tabId: string; host: ClientHost }) {
                     <ConflictEditor
                       conflict={conflict}
                       onSave={(content) => send({ type: "git:resolveConflict", tabId, path: selected.path, content, delete: false })}
+                      onChooseSide={(side) => send({ type: "git:resolveConflictSide", tabId, path: selected.path, side })}
                       onDelete={() => send({ type: "git:resolveConflict", tabId, path: selected.path, content: "", delete: true })}
                     />
                   ) : (

@@ -1,9 +1,9 @@
 import { describe, test, expect, beforeAll } from "bun:test";
-import { mkdtemp, rm, writeFile, realpath } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile, realpath } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "bun";
-import { resolveRoot, initRepository, status, runGit, diff, conflictFile, saveConflictResolution, commitDiff, compareRefs, fileInsight, stage, stageHunk, unstage, discard, ignore, commit, commitContext, branches, remoteBranches, checkout, branchCreate, branchDelete, merge, rebase, rebasePlan, interactiveRebase, cherryPick, revert, bisect, reflog, resetTo, recoverBranch, worktrees, worktreeAdd, worktreeRemove, worktreeLock, stashes, stashCreate, stashDiff, stashDrop, log, tags, tagCreate, remotes, remoteAdd, remoteUpdate, remoteRemove, submodules, subtreeSync, fetchRemote, pull, push, operationAction } from "./git.ts";
+import { resolveRoot, initRepository, status, runGit, diff, conflictFile, saveConflictResolution, chooseConflictSide, commitDiff, compareRefs, fileInsight, stage, stageHunk, unstage, discard, ignore, commit, commitContext, branches, remoteBranches, checkout, branchCreate, branchDelete, merge, rebase, rebasePlan, interactiveRebase, cherryPick, revert, bisect, reflog, resetTo, recoverBranch, worktrees, worktreeAdd, worktreeRemove, worktreeLock, stashes, stashCreate, stashDiff, stashDrop, log, tags, tagCreate, remotes, remoteAdd, remoteUpdate, remoteRemove, submodules, subtreeSync, fetchRemote, pull, push, operationAction } from "./git.ts";
 import { serializeSelectedLines } from "../src/git/patch.ts";
 
 async function git(cwd: string, ...args: string[]): Promise<void> {
@@ -196,6 +196,34 @@ describe("git.ts: operation state", () => {
     const snap = await status(root);
     expect(snap.files.find(f => f.code === "U")).toBeUndefined();
     expect(snap.staged).toContainEqual(expect.objectContaining({ path: "README.md" }));
+  });
+
+  test("chooses a binary conflict side without decoding or changing bytes", async () => {
+    const root = await makeRepo();
+    const base = new Uint8Array([0, 1, 2, 3]);
+    const ours = new Uint8Array([0, 255, 4, 5]);
+    const theirs = new Uint8Array([0, 128, 6, 7]);
+    await writeFile(join(root, "asset.bin"), base);
+    await git(root, "add", "asset.bin");
+    await git(root, "commit", "-q", "-m", "add binary");
+    await git(root, "checkout", "-q", "-b", "topic");
+    await writeFile(join(root, "asset.bin"), theirs);
+    await git(root, "commit", "-q", "-am", "topic binary");
+    await git(root, "checkout", "-q", "main");
+    await writeFile(join(root, "asset.bin"), ours);
+    await git(root, "commit", "-q", "-am", "main binary");
+    expect((await runGit(root, ["merge", "topic"])).exitCode).not.toBe(0);
+
+    const conflict = await conflictFile(root, "asset.bin");
+    expect(conflict.isBinary).toBe(true);
+    expect(conflict.ours).toBe("");
+    expect(conflict.theirs).toBe("");
+
+    await chooseConflictSide(root, "asset.bin", "theirs");
+    expect([...await readFile(join(root, "asset.bin"))]).toEqual([...theirs]);
+    const snap = await status(root);
+    expect(snap.files.find(file => file.code === "U")).toBeUndefined();
+    expect(snap.staged).toContainEqual(expect.objectContaining({ path: "asset.bin" }));
   });
 });
 

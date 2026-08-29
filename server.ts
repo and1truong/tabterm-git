@@ -157,6 +157,11 @@ export default function activate(host: ServerHost) {
             if (msg.delete) await git.deleteConflictResolution(root, msg.path);
             else await git.saveConflictResolution(root, msg.path, msg.content);
             break;
+          case "git:resolveConflictSide":
+            refresh = true;
+            if (msg.side !== "ours" && msg.side !== "theirs") throw new Error("Invalid conflict side.");
+            await git.chooseConflictSide(root, msg.path, msg.side);
+            break;
           case "git:commit":  refresh = true; refsChanged = true; await git.commit(root, msg.message, msg.amend, msg.signoff, msg.sign); break;
           case "git:checkout":     refresh = true; refsChanged = true; await git.checkout(root, msg.branch); break;
           case "git:checkoutRemote": refresh = true; refsChanged = true; await git.checkoutRemote(root, msg.branch, msg.localName); break;

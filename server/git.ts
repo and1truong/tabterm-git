@@ -222,14 +222,23 @@ export async function diff(root: string, path: string, staged: boolean): Promise
 
 export async function conflictFile(root: string, path: string): Promise<ConflictPayload> {
   const target = await safeWorktreePath(root, path);
-  const [base, ours, theirs, result] = await Promise.all([
-    conflictStage(root, 1, path),
-    conflictStage(root, 2, path),
-    conflictStage(root, 3, path),
-    readFile(target, "utf8").catch(() => ""),
+  const [baseBytes, oursBytes, theirsBytes, resultBytes] = await Promise.all([
+    conflictStageBytes(root, 1, path),
+    conflictStageBytes(root, 2, path),
+    conflictStageBytes(root, 3, path),
+    readFile(target).catch(() => new Uint8Array()),
   ]);
-  const values = [base, ours, theirs, result].filter((v): v is string => v !== null);
-  return { path, base, ours, theirs, result, isBinary: values.some(v => v.includes("\0")) };
+  const values = [baseBytes, oursBytes, theirsBytes, resultBytes].filter((value): value is Uint8Array => value !== null);
+  const isBinary = values.some(isBinaryData);
+  const decodeStage = (value: Uint8Array | null) => value === null ? null : isBinary ? "" : new TextDecoder().decode(value);
+  return {
+    path,
+    base: decodeStage(baseBytes),
+    ours: decodeStage(oursBytes),
+    theirs: decodeStage(theirsBytes),
+    result: isBinary ? "" : new TextDecoder().decode(resultBytes),
+    isBinary,
+  };
 }
 
 export async function saveConflictResolution(root: string, path: string, content: string): Promise<void> {
@@ -238,14 +247,32 @@ export async function saveConflictResolution(root: string, path: string, content
   await stage(root, [path]);
 }
 
+export async function chooseConflictSide(root: string, path: string, side: "ours" | "theirs"): Promise<void> {
+  await safeWorktreePath(root, path);
+  await mustRun(root, ["checkout", `--${side}`, "--", path]);
+  await stage(root, [path]);
+}
+
 export async function deleteConflictResolution(root: string, path: string): Promise<void> {
   await safeWorktreePath(root, path);
   await mustRun(root, ["rm", "--", path]);
 }
 
-async function conflictStage(root: string, stage: 1 | 2 | 3, path: string): Promise<string | null> {
-  const r = await runGit(root, ["show", `:${stage}:${path}`]);
-  return r.exitCode === 0 ? r.stdout : null;
+async function conflictStageBytes(root: string, stage: 1 | 2 | 3, path: string): Promise<Uint8Array | null> {
+  const proc = spawn(["git", "-C", root, "show", `:${stage}:${path}`], { stdout: "pipe", stderr: "ignore" });
+  const bytes = new Uint8Array(await new Response(proc.stdout).arrayBuffer());
+  await proc.exited;
+  return proc.exitCode === 0 ? bytes : null;
+}
+
+function isBinaryData(value: Uint8Array): boolean {
+  if (value.includes(0)) return true;
+  try {
+    new TextDecoder("utf-8", { fatal: true }).decode(value);
+    return false;
+  } catch {
+    return true;
+  }
 }
 
 async function safeWorktreePath(root: string, path: string): Promise<string> {

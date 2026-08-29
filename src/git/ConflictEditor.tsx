@@ -1,9 +1,10 @@
 import { useEffect, useState } from "react";
 import type { ConflictPayload } from "../../shared.ts";
 
-export function ConflictEditor({ conflict, onSave, onDelete }: {
+export function ConflictEditor({ conflict, onSave, onChooseSide, onDelete }: {
   conflict: ConflictPayload;
   onSave: (content: string) => void;
+  onChooseSide: (side: "ours" | "theirs") => void;
   onDelete: () => void;
 }) {
   const [result, setResult] = useState(conflict.result);
@@ -16,8 +17,8 @@ export function ConflictEditor({ conflict, onSave, onDelete }: {
       <div className="flex flex-col gap-3 p-4 text-sm text-[var(--muted)]">
         <span>This conflicted file is binary and cannot be edited here.</span>
         <div className="flex gap-2">
-          <Action label="Use ours" onClick={() => conflict.ours !== null && onSave(conflict.ours)} disabled={conflict.ours === null} />
-          <Action label="Use theirs" onClick={() => conflict.theirs !== null && onSave(conflict.theirs)} disabled={conflict.theirs === null} />
+          <Action label="Use ours" onClick={() => onChooseSide("ours")} disabled={conflict.ours === null} />
+          <Action label="Use theirs" onClick={() => onChooseSide("theirs")} disabled={conflict.theirs === null} />
           <Action label="Delete file" danger onClick={onDelete} />
         </div>
       </div>

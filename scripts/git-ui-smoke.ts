@@ -19,6 +19,7 @@ async function main() {
   const { createRoot } = await import("react-dom/client");
   const { flushSync } = await import("react-dom");
   const { ConflictEditor } = await import("../src/git/ConflictEditor.tsx");
+  const { DiffView } = await import("../src/git/DiffView.tsx");
   const { CommitComposer } = await import("../src/git/CommitComposer.tsx");
   const { RebasePlanView } = await import("../src/git/RebasePlanView.tsx");
   const { RecoveryView } = await import("../src/git/RecoveryView.tsx");
@@ -40,9 +41,11 @@ async function main() {
   document.body.appendChild(container);
   const root = createRoot(container);
 
+  const chosenSides: string[] = [];
   flushSync(() => root.render(React.createElement(ConflictEditor, {
     conflict,
     onSave: (content: string) => saved.push(content),
+    onChooseSide: (side: string) => chosenSides.push(side),
     onDelete: () => deleted++,
   })));
   if (!container.textContent?.includes("Ours · current branch") || !container.textContent.includes("Theirs · incoming")) {
@@ -68,6 +71,26 @@ async function main() {
 
   flushSync(() => click("Delete file"));
   if (deleted !== 1) fail("Delete file did not invoke its action");
+
+  flushSync(() => root.render(React.createElement(ConflictEditor, {
+    conflict: { ...conflict, base: "", ours: "", theirs: "", result: "", isBinary: true },
+    onSave: (content: string) => saved.push(content),
+    onChooseSide: (side: string) => chosenSides.push(side),
+    onDelete: () => deleted++,
+  })));
+  flushSync(() => click("Use theirs"));
+  if (chosenSides[0] !== "theirs") fail("binary conflict choice was not delegated to the server");
+
+  const diffContainer = document.createElement("div");
+  document.body.appendChild(diffContainer);
+  const diffRoot = createRoot(diffContainer);
+  const replacementDiff = {
+    path: "file.txt", staged: true, isBinary: false,
+    hunks: [{ header: "@@ -1 +1 @@", lines: [{ kind: "-" as const, src: "old" }, { kind: "+" as const, src: "new" }] }],
+  };
+  flushSync(() => diffRoot.render(React.createElement(DiffView, { diff: replacementDiff, onStageHunk: () => {} })));
+  if (diffContainer.querySelector('[aria-label^="unstage line"]')) fail("staged replacement exposed unsafe per-line unstaging");
+  if (![...diffContainer.querySelectorAll("button")].some(button => button.textContent?.trim() === "unstage hunk")) fail("staged diff lost hunk unstaging");
 
   const commitContainer = document.createElement("div");
   document.body.appendChild(commitContainer);
@@ -172,7 +195,30 @@ async function main() {
   flushSync(() => initButton.click());
   if (!initMessages.some(message => message.type === "git:init" && message.tabId === "tab-1")) fail("initialize action sent the wrong payload");
 
-  console.log("PASS: conflict, commit, interactive rebase, recovery, branch menu, and repository initialization interactions work");
+  const contextContainer = document.createElement("div");
+  document.body.appendChild(contextContainer);
+  const contextRoot = createRoot(contextContainer);
+  const contextMessages: any[] = [];
+  const snapshot = (headSha: string) => ({
+    branch: "main", detached: false, headSha, upstream: null, ahead: null, behind: null,
+    files: [], staged: [], operation: null, fetchedAt: Date.now(),
+  });
+  let contextHostState: any = { gitStatus: { "tab-1": snapshot("aaaaaaa") }, gitNoRepo: {}, gitError: {}, gitSubtrees: {} };
+  const contextHost = {
+    send: (message: any) => contextMessages.push(message),
+    store: {
+      use: (selector: (state: any) => unknown) => selector(contextHostState),
+      setState: (update: (state: any) => any) => { contextHostState = update(contextHostState); },
+    },
+    workspaces: { get: () => ({ id: "tab-1", label: "Repo", cwd: "/tmp/repo" }) },
+    kv: { get: () => undefined, set: () => {} },
+  };
+  flushSync(() => contextRoot.render(React.createElement(GitPanel, { tabId: "tab-1", host: contextHost })));
+  contextHostState = { ...contextHostState, gitStatus: { "tab-1": snapshot("bbbbbbb") } };
+  flushSync(() => contextRoot.render(React.createElement(GitPanel, { tabId: "tab-1", host: contextHost })));
+  if (contextMessages.filter(message => message.type === "git:openCommitContext").length !== 2) fail("commit context did not refresh after HEAD changed");
+
+  console.log("PASS: conflict, diff, commit, interactive rebase, recovery, branch menu, repository initialization, and HEAD refresh interactions work");
   process.exit(0);
 }
 

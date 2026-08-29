@@ -11,6 +11,9 @@ interface Props {
 
 export function DiffView({ diff, onStageHunk }: Props) {
   const langHint = useMemo(() => guessLang(diff.path), [diff.path]);
+  // Partial-patch normalization is forward-only. A staged replacement needs a
+  // different reverse patch, so staged diffs intentionally unstage by hunk.
+  const canStageLines = !!onStageHunk && !diff.staged;
 
   if (diff.isBinary) {
     return <div className="px-4 py-3 text-[var(--muted)] text-sm">Binary file. No textual diff.</div>;
@@ -29,9 +32,9 @@ export function DiffView({ diff, onStageHunk }: Props) {
           <Hunk key={idx} h={h} langHint={langHint}
             action={diff.staged ? "unstage" : "stage"}
             onStage={onStageHunk ? () => onStageHunk(serializeHunk(h, diff.path), diff.path, diff.staged) : undefined}
-            onStageLine={onStageHunk ? (line) => {
+            onStageLine={canStageLines ? (line) => {
               const patch = serializeSelectedLines(h, diff.path, new Set([line]));
-              if (patch) onStageHunk(patch, diff.path, diff.staged);
+              if (patch) onStageHunk!(patch, diff.path, false);
             } : undefined} />
         ))}
       </div>
