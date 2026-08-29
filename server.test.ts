@@ -1,5 +1,5 @@
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
-import { mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "bun";
@@ -151,3 +151,59 @@ async function run(cwd: string, args: string[]): Promise<string> {
   await p.exited;
   return stdout;
 }
+
+describe("git module: throttled submodule refresh preserves the list", () => {
+  test("refs pushes never drop submodules between cadence ticks", async () => {
+    const repo = await makeRepo();
+    const lib = await makeRepo();
+    await git(repo, "-c", "protocol.file.allow=always", "submodule", "add", lib, "vendor/lib");
+    await git(repo, "commit", "-q", "-m", "add submodule");
+    const { host, spec } = fakeHost({ tab1: repo });
+    activate(host);
+    const { peer } = captureSends();
+    // Join loads submodules eagerly (includeSubmodules = true).
+    await spec().onJoin!(ctxFor("tab1"), peer);
+
+    const pushed: any[] = [];
+    const ctx = ctxFor("tab1", pushed);
+    // Ticks 1..5: status pushes + one refs push at tick 3, where the expensive
+    // `git submodule status` is throttled off. The cached list must be reused
+    // instead of broadcasting an empty submodule array.
+    for (let i = 0; i < 5; i++) await spec().poll!(ctx);
+    const refsMsgs = pushed.filter((m) => m.type === "git:refs");
+    expect(refsMsgs.length).toBeGreaterThanOrEqual(1);
+    for (const m of refsMsgs) expect(m.refs.submodules).toHaveLength(1);
+    await rm(repo, { recursive: true, force: true });
+    await rm(lib, { recursive: true, force: true });
+  });
+});
+
+describe("git module: root cache detects repository-boundary changes", () => {
+  test("git init inside a cached parent-root workspace switches roots", async () => {
+    const parent = await makeRepo();
+    const work = join(parent, "inner");
+    await mkdir(work);
+    const { host, spec } = fakeHost({ tab1: work });
+    activate(host);
+    const { peer } = captureSends();
+
+    // First poll resolves and caches the PARENT repo as the workspace root.
+    const pushed: any[] = [];
+    const ctx = ctxFor("tab1", pushed);
+    await spec().poll!(ctx);
+    const first = pushed.find((m) => m.type === "git:status");
+    expect(first).toBeDefined();
+    expect(first.snapshot.headSha).not.toBeNull(); // parent repo has commits
+
+    // A nested repository appears at the workspace cwd; the next poll must
+    // notice the boundary and re-resolve to the fresh repo (no commits yet).
+    await git(work, "init", "-q", "-b", "main");
+    pushed.length = 0;
+    await spec().poll!(ctx);
+    const second = pushed.find((m) => m.type === "git:status");
+    expect(second).toBeDefined();
+    expect(second.snapshot.headSha).toBeNull();
+    expect(second.snapshot.branch).toBe("main");
+    await rm(parent, { recursive: true, force: true });
+  });
+});

@@ -1,8 +1,8 @@
 import type { ServerHost, RoomContext, Peer } from "@tabterm/module-host/server";
 import * as git from "./server/git.ts";
-import type { GitSnapshot, GitRefs, GitJob, GitOperation } from "./shared.ts";
-import { stat as pathStat } from "node:fs/promises";
-import { join as joinPath } from "node:path";
+import type { GitSnapshot, GitRefs, GitJob, GitOperation, Submodule } from "./shared.ts";
+import { stat as pathStat, realpath as pathRealpath } from "node:fs/promises";
+import { dirname as pathDirname, join as joinPath } from "node:path";
 import { subtreeMigrations } from "./server/subtreeMigrations.ts";
 import { makeSubtreeDb } from "./server/subtreeDb.ts";
 import { makeSubtreeService } from "./server/subtreeService.ts";
@@ -29,6 +29,32 @@ async function dirExists(p: string): Promise<boolean> {
   try { await pathStat(p); return true; } catch { return false; }
 }
 
+// A cached root is valid only while no repository boundary changed between the
+// workspace cwd and that root. Walking up from the cwd:
+//   - a `.git` marker appearing closer than the cached root (e.g. `git init`
+//     inside a subdirectory of a parent repository) invalidates the entry;
+//   - reaching the cached root without finding its own marker (repo deleted)
+//     invalidates it too.
+// Paths are compared in realpath space: resolveRoot returns a realpath'd root,
+// and symlinked cwds (e.g. /tmp → /private/tmp on macOS) otherwise never meet
+// it as a string prefix.
+async function rootCacheValid(entry: { cwd: string; root: string | null }): Promise<boolean> {
+  if (entry.root === null) {
+    // Cached "no repo": re-resolve once a .git marker appears at the cwd
+    // (stat follows symlinks, so the raw cwd is fine here).
+    return !(await dirExists(joinPath(entry.cwd, ".git")));
+  }
+  let start: string;
+  try { start = await pathRealpath(entry.cwd); } catch { return false; }
+  let p = start;
+  const stop = entry.root;
+  for (;;) {
+    if (await dirExists(joinPath(p, ".git"))) return p === stop;  // first marker must be the cached root
+    if (p === stop || p === pathDirname(p)) return false;          // root reached without its marker
+    p = pathDirname(p);
+  }
+}
+
 export default function activate(host: ServerHost) {
   host.migrate(subtreeMigrations);
   const sdb = makeSubtreeDb(host.db);
@@ -45,19 +71,18 @@ export default function activate(host: ServerHost) {
   const activeJobs = new Map<string, GitJob>();
   // Resolved roots are stable for a workspace cwd. Resolving spawns
   // `git rev-parse --show-toplevel` (~30ms), so cache and re-resolve only when
-  // the cwd moves, the cached root disappears, or a .git marker appears where
-  // we cached "no repo" (e.g. `git init` from a terminal).
+  // the cwd moves, the cached root disappears, or a `.git` marker appears
+  // closer to the cwd (e.g. `git init` from a terminal).
   const rootCache = new Map<string, { cwd: string; root: string | null }>();
+  // Last successful submodule list per workspace, reused on throttled ticks so
+  // a `git:refs` push never resets the sidebar to an empty submodule list.
+  const cachedSubmodules = new Map<string, Submodule[]>();
 
   const rootFor = async (key: string): Promise<string | null> => {
     const cwd = host.workspaces.get(key)?.cwd;
     if (!cwd) { rootCache.delete(key); return null; }
     const entry = rootCache.get(key);
-    if (entry && entry.cwd === cwd) {
-      const probe = entry.root ?? joinPath(entry.cwd, ".git");
-      if (await dirExists(probe)) return entry.root;
-      rootCache.delete(key);
-    }
+    if (entry && entry.cwd === cwd && await rootCacheValid(entry)) return entry.root;
     const root = await git.resolveRoot(cwd);
     rootCache.set(key, { cwd, root });
     return root;
@@ -74,6 +99,11 @@ export default function activate(host: ServerHost) {
       const refs: GitRefs = { branches: all.branches, remoteBranches: all.remoteBranches, current, remotes, stashes, tags: all.tags, submodules: [], worktrees };
       if (includeSubmodules || (refsTick.get(key) ?? 0) % SUBMODULES_EVERY === 0) {
         refs.submodules = await git.submodules(root);
+        cachedSubmodules.set(key, refs.submodules);
+      } else {
+        // Throttled ticks reuse the last successful list instead of resetting
+        // the client to "no submodules" between refresh cycles.
+        refs.submodules = cachedSubmodules.get(key) ?? [];
       }
       return { type: "git:refs", tabId: key, refs };
     } catch (e) {
@@ -126,7 +156,7 @@ export default function activate(host: ServerHost) {
       // the background refreshes.
       peer.send(await refsMsg(ctx.key, true));
     },
-    onIdle: (key: string) => { latestStatus.delete(key); lastStatusOut.delete(key); refsTick.delete(key); activeJobs.delete(key); rootCache.delete(key); },
+    onIdle: (key: string) => { latestStatus.delete(key); lastStatusOut.delete(key); refsTick.delete(key); activeJobs.delete(key); rootCache.delete(key); cachedSubmodules.delete(key); },
     onRequest: async (ctx: RoomContext, msg: any, peer: Peer) => {
       const err = (m: string) => peer.send({ type: "git:error", tabId: ctx.key, message: m });
       if (msg.type === "git:init") {
