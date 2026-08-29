@@ -1,15 +1,32 @@
 import type { ServerHost, RoomContext, Peer } from "@tabterm/module-host/server";
 import * as git from "./server/git.ts";
-import type { GitSnapshot, GitRefs, GitJob } from "./shared.ts";
+import type { GitSnapshot, GitRefs, GitJob, GitOperation } from "./shared.ts";
+import { stat as pathStat } from "node:fs/promises";
+import { join as joinPath } from "node:path";
 import { subtreeMigrations } from "./server/subtreeMigrations.ts";
 import { makeSubtreeDb } from "./server/subtreeDb.ts";
 import { makeSubtreeService } from "./server/subtreeService.ts";
 
 const POLL_MS = 1500;
-const REFS_EVERY = 3; // ~5s at 1.5s poll
+const REFS_EVERY = 3; // ~4.5s at 1.5s poll
+// `git submodule status` stats every submodule worktree and is by far the
+// most expensive refs command; run it on a slower cadence (~13.5s) instead of
+// piggybacking on every refs refresh. Changed/conflicted submodules still
+// surface immediately through the porcelain status poll.
+const SUBMODULES_EVERY = 9;
+const SUBMODULE_MUTATIONS = new Set(["git:submoduleUpdate", "git:submoduleUpdateRemote", "git:subtreeSync"]);
 
 function emptyRefs(): GitRefs {
   return { branches: [], remoteBranches: [], current: null, remotes: [], stashes: [], tags: [], submodules: [], worktrees: [] };
+}
+
+// Stable identity of an operation state, for change detection between polls.
+function opKey(op: GitOperation | null): string {
+  return op ? `${op.type}:${op.current ?? "-"}:${op.total ?? "-"}` : "-";
+}
+
+async function dirExists(p: string): Promise<boolean> {
+  try { await pathStat(p); return true; } catch { return false; }
 }
 
 export default function activate(host: ServerHost) {
@@ -20,23 +37,44 @@ export default function activate(host: ServerHost) {
   host.registerRoute("GET", "/subtrees", () => Response.json({ subtrees: sdb.list() }));
 
   const latestStatus = new Map<string, GitSnapshot>();
+  // Fingerprint (status stdout + operation) of the last pushed snapshot — a
+  // repo that hasn't changed must not re-render the client or re-serialize a
+  // potentially huge payload every poll.
+  const lastStatusOut = new Map<string, string>();
   const refsTick = new Map<string, number>();
   const activeJobs = new Map<string, GitJob>();
+  // Resolved roots are stable for a workspace cwd. Resolving spawns
+  // `git rev-parse --show-toplevel` (~30ms), so cache and re-resolve only when
+  // the cwd moves, the cached root disappears, or a .git marker appears where
+  // we cached "no repo" (e.g. `git init` from a terminal).
+  const rootCache = new Map<string, { cwd: string; root: string | null }>();
 
-  const rootFor = (key: string) => {
+  const rootFor = async (key: string): Promise<string | null> => {
     const cwd = host.workspaces.get(key)?.cwd;
-    return cwd ? git.resolveRoot(cwd) : Promise.resolve(null);
+    if (!cwd) { rootCache.delete(key); return null; }
+    const entry = rootCache.get(key);
+    if (entry && entry.cwd === cwd) {
+      const probe = entry.root ?? joinPath(entry.cwd, ".git");
+      if (await dirExists(probe)) return entry.root;
+      rootCache.delete(key);
+    }
+    const root = await git.resolveRoot(cwd);
+    rootCache.set(key, { cwd, root });
+    return root;
   };
 
-  async function refsMsg(key: string) {
+  async function refsMsg(key: string, includeSubmodules = false) {
     const root = await rootFor(key);
     if (!root) return { type: "git:refs", tabId: key, refs: emptyRefs() };
     try {
-      const [branches, remoteBranches, remotes, stashes, tags, submodules, worktrees] = await Promise.all([
-        git.branches(root), git.remoteBranches(root), git.remotes(root), git.stashes(root), git.tags(root), git.submodules(root), git.worktrees(root),
+      const [all, remotes, stashes, worktrees] = await Promise.all([
+        git.refsOf(root), git.remotes(root), git.stashes(root), git.worktrees(root),
       ]);
-      const current = branches.find((b) => b.current)?.name ?? null;
-      const refs: GitRefs = { branches, remoteBranches, current, remotes, stashes, tags, submodules, worktrees };
+      const current = all.branches.find((b) => b.current)?.name ?? null;
+      const refs: GitRefs = { branches: all.branches, remoteBranches: all.remoteBranches, current, remotes, stashes, tags: all.tags, submodules: [], worktrees };
+      if (includeSubmodules || (refsTick.get(key) ?? 0) % SUBMODULES_EVERY === 0) {
+        refs.submodules = await git.submodules(root);
+      }
       return { type: "git:refs", tabId: key, refs };
     } catch (e) {
       return { type: "git:error", tabId: key, message: `Unable to refresh refs: ${(e as Error).message}` };
@@ -52,13 +90,23 @@ export default function activate(host: ServerHost) {
     poll: async (ctx: RoomContext) => {
       const root = await rootFor(ctx.key);
       if (!root) return undefined;
-      let snap: GitSnapshot;
-      try { snap = await git.status(root); } catch { return undefined; }
-      latestStatus.set(ctx.key, snap);
       const t = (refsTick.get(ctx.key) ?? 0) + 1;
       refsTick.set(ctx.key, t);
+      let out: { snapshot: GitSnapshot; raw: string };
+      try { out = await git.statusWithRaw(root); } catch { rootCache.delete(ctx.key); return undefined; }
+      // Skip the push entirely when nothing changed (raw stdout AND operation
+      // state — a merge/cherry-pick/revert can start without touching files).
+      // The host keeps polling regardless of the returned value.
+      const fingerprint = out.raw + "\u0000" + opKey(out.snapshot.operation);
+      if (lastStatusOut.get(ctx.key) !== fingerprint) {
+        lastStatusOut.set(ctx.key, fingerprint);
+        latestStatus.set(ctx.key, out.snapshot);
+        ctx.push({ type: "git:status", tabId: ctx.key, snapshot: out.snapshot });
+      }
+      // Refs are independent of the working tree; push after status so a slow
+      // refs refresh (submodule status) never delays the status message.
       if (t % REFS_EVERY === 0) ctx.push(await refsMsg(ctx.key));
-      return { type: "git:status", tabId: ctx.key, snapshot: snap };
+      return undefined;
     },
     onJoin: async (ctx: RoomContext, peer: Peer) => {
       // Three states the panel needs to tell apart on join:
@@ -74,20 +122,25 @@ export default function activate(host: ServerHost) {
       } else if (!(await rootFor(ctx.key))) {
         peer.send({ type: "git:noRepo", tabId: ctx.key });
       }
-      peer.send(await refsMsg(ctx.key));
+      // A fresh join sees submodules immediately; the cadence only throttles
+      // the background refreshes.
+      peer.send(await refsMsg(ctx.key, true));
     },
-    onIdle: (key: string) => { latestStatus.delete(key); refsTick.delete(key); activeJobs.delete(key); },
+    onIdle: (key: string) => { latestStatus.delete(key); lastStatusOut.delete(key); refsTick.delete(key); activeJobs.delete(key); rootCache.delete(key); },
     onRequest: async (ctx: RoomContext, msg: any, peer: Peer) => {
       const err = (m: string) => peer.send({ type: "git:error", tabId: ctx.key, message: m });
       if (msg.type === "git:init") {
         const cwd = host.workspaces.get(ctx.key)?.cwd;
         if (!cwd) { err("Workspace directory not found."); return; }
         try {
+          rootCache.delete(ctx.key); // may have cached "no repo" for this cwd
           const root = await git.initRepository(cwd);
-          const snapshot = await git.status(root);
-          latestStatus.set(ctx.key, snapshot);
+          rootCache.set(ctx.key, { cwd, root });
+          const out = await git.statusWithRaw(root);
+          lastStatusOut.set(ctx.key, out.raw + "\u0000" + opKey(out.snapshot.operation));
+          latestStatus.set(ctx.key, out.snapshot);
           refsTick.set(ctx.key, 0);
-          ctx.push({ type: "git:status", tabId: ctx.key, snapshot });
+          ctx.push({ type: "git:status", tabId: ctx.key, snapshot: out.snapshot });
           ctx.push(await refsMsg(ctx.key));
         } catch (e) {
           err((e as Error).message);
@@ -218,9 +271,14 @@ export default function activate(host: ServerHost) {
         // Refresh even after a failed mutation: merge/rebase/pull can leave a
         // valid conflicted operation state that the UI must surface.
         if (refresh) {
-        let snap: GitSnapshot;
-        try { snap = await git.status(root); latestStatus.set(ctx.key, snap); ctx.push({ type: "git:status", tabId: ctx.key, snapshot: snap }); } catch { /* keep last */ }
-        if (refsChanged) ctx.push(await refsMsg(ctx.key));
+        let out: { snapshot: GitSnapshot; raw: string };
+        try {
+          out = await git.statusWithRaw(root);
+          lastStatusOut.set(ctx.key, out.raw + "\u0000" + opKey(out.snapshot.operation));
+          latestStatus.set(ctx.key, out.snapshot);
+          ctx.push({ type: "git:status", tabId: ctx.key, snapshot: out.snapshot });
+        } catch { /* keep last */ }
+        if (refsChanged) ctx.push(await refsMsg(ctx.key, SUBMODULE_MUTATIONS.has(msg.type)));
         }
         if (descriptor) {
           activeJobs.delete(ctx.key);

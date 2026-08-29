@@ -11,7 +11,11 @@ export interface GitResult { stdout: string; stderr: string; exitCode: number }
 const networkProcesses = new Map<string, ReturnType<typeof spawn>>();
 
 export async function runGit(root: string, args: string[], env?: Record<string, string>): Promise<GitResult> {
-  const proc = spawn(["git", "-C", root, ...args], { stdout: "pipe", stderr: "pipe", ...(env ? { env: { ...process.env, ...env } } : {}) });
+  // --no-optional-locks: read commands (status/diff/log/…) must not take the
+  // optional index lock — the module fires git constantly, and grabbing the
+  // lock would race with git commands the user runs in their own terminal
+  // ("index.lock exists"). Required locks (commit/add/…) are unaffected.
+  const proc = spawn(["git", "-C", root, "--no-optional-locks", ...args], { stdout: "pipe", stderr: "pipe", ...(env ? { env: { ...process.env, ...env } } : {}) });
   const [stdout, stderr] = await Promise.all([
     new Response(proc.stdout).text(),
     new Response(proc.stderr).text(),
@@ -80,6 +84,10 @@ export async function initRepository(cwd: string): Promise<string> {
 // is one of "?" "M" "C" "U" "N"; we collapse them to a single 'S' code so
 // the UI can show "submodule pointer changed" distinctly from a file edit.
 export async function status(root: string): Promise<GitSnapshot> {
+  return (await statusWithRaw(root)).snapshot;
+}
+
+export async function statusWithRaw(root: string): Promise<{ snapshot: GitSnapshot; raw: string }> {
   const [r, operation] = await Promise.all([
     runGit(root, ["status", "--porcelain=v2", "--branch", "-uall"]),
     operationState(root),
@@ -152,11 +160,33 @@ export async function status(root: string): Promise<GitSnapshot> {
       });
     }
   }
-  return { branch, detached, headSha, upstream, ahead, behind, files, staged, operation, fetchedAt: Date.now() };
+  return { snapshot: { branch, detached, headSha, upstream, ahead, behind, files, staged, operation, fetchedAt: Date.now() }, raw: r.stdout };
+}
+
+// The git dir for a checkout, worktree, or submodule, via fs only: `.git` is a
+// directory, a symlink to one, or a file containing "gitdir: <path>" (linked
+// worktrees/submodules). The hot poll path calls this every cycle — the former
+// `rev-parse --git-path` spawns here were half the per-poll process count.
+async function gitDir(root: string): Promise<string | null> {
+  const dotGit = join(root, ".git");
+  let st;
+  try { st = await lstat(dotGit); } catch { return null; }
+  if (st.isDirectory()) return dotGit;
+  if (st.isSymbolicLink()) {
+    try { return await realpath(dotGit); } catch { return null; }
+  }
+  try {
+    const m = (await readFile(dotGit, "utf8")).match(/^gitdir:\s*(.+?)\s*$/m);
+    return m ? resolvePath(root, m[1]!) : null;
+  } catch {
+    return null;
+  }
 }
 
 async function operationState(root: string): Promise<GitOperation | null> {
-  const rebaseMerge = await gitPath(root, "rebase-merge");
+  const dir = await gitDir(root);
+  if (!dir) return null;
+  const rebaseMerge = join(dir, "rebase-merge");
   if (await exists(rebaseMerge)) {
     return {
       type: "rebase",
@@ -164,7 +194,7 @@ async function operationState(root: string): Promise<GitOperation | null> {
       total: await readInt(join(rebaseMerge, "end")),
     };
   }
-  const rebaseApply = await gitPath(root, "rebase-apply");
+  const rebaseApply = join(dir, "rebase-apply");
   if (await exists(rebaseApply)) {
     return {
       type: "rebase",
@@ -172,25 +202,22 @@ async function operationState(root: string): Promise<GitOperation | null> {
       total: await readInt(join(rebaseApply, "last")),
     };
   }
-  for (const [type, ref] of [
+  for (const [type, marker] of [
     ["merge", "MERGE_HEAD"],
     ["cherry-pick", "CHERRY_PICK_HEAD"],
     ["revert", "REVERT_HEAD"],
   ] as const) {
-    if ((await runGit(root, ["rev-parse", "-q", "--verify", ref])).exitCode === 0) {
-      return { type, current: null, total: null };
-    }
+    if (await exists(join(dir, marker))) return { type, current: null, total: null };
   }
-  if ((await runGit(root, ["rev-parse", "-q", "--verify", "refs/bisect/bad"])).exitCode === 0) {
+  // An active bisect leaves BISECT_START/BISECT_LOG plus loose refs/bisect/*
+  // refs in the git dir. Check all markers so a freshly started-but-unmarked
+  // session surfaces too (BISECT_START alone).
+  if (await exists(join(dir, "BISECT_START"))
+      || await exists(join(dir, "BISECT_LOG"))
+      || await exists(join(dir, "refs/bisect/bad"))) {
     return { type: "bisect", current: null, total: null };
   }
   return null;
-}
-
-async function gitPath(root: string, name: string): Promise<string> {
-  const r = await runGit(root, ["rev-parse", "--git-path", name]);
-  const path = r.stdout.trim();
-  return resolvePath(root, path);
 }
 
 async function exists(path: string): Promise<boolean> {
@@ -441,37 +468,48 @@ export async function commitContext(root: string): Promise<CommitContext> {
   };
 }
 
-export async function branches(root: string): Promise<Branch[]> {
-  // `git for-each-ref --format` is the stable parser-friendly form.
-  const fmt = "%(refname:short)\t%(HEAD)\t%(upstream:short)\t%(upstream:track)";
-  const r = await mustRun(root, ["for-each-ref", "--format=" + fmt, "refs/heads"]);
-  const out: Branch[] = [];
+// One `for-each-ref` covers local branches, remote-tracking branches, and tags
+// (the refs refresh used to spawn three processes for these). The superset
+// format carries every field the three lists need; callers slice by refname
+// prefix. Tag order keeps `git tag --list --sort=-creatordate` semantics via
+// the explicit creatordate field.
+export async function refsOf(root: string): Promise<{ branches: Branch[]; remoteBranches: RemoteBranch[]; tags: string[] }> {
+  const fmt = ["%(refname)", "%(HEAD)", "%(upstream:short)", "%(upstream:track)", "%(objectname:short)", "%(symref)", "%(creatordate:unix)"].join("\t");
+  const r = await mustRun(root, ["for-each-ref", `--format=${fmt}`, "refs/heads", "refs/remotes", "refs/tags"]);
+  const branches: Branch[] = [];
+  const remoteBranches: RemoteBranch[] = [];
+  const tagDates: { name: string; date: number }[] = [];
   for (const line of r.split("\n")) {
     if (!line) continue;
-    const [name, head, up, track] = line.split("\t");
-    let ahead = 0, behind = 0;
-    const am = track?.match(/ahead (\d+)/);
-    const bm = track?.match(/behind (\d+)/);
-    if (am) ahead = Number(am[1]);
-    if (bm) behind = Number(bm[1]);
-    out.push({ name: name ?? "", current: head === "*", upstream: up || null, ahead, behind });
+    const [ref = "", head = "", up = "", track = "", sha = "", symref = "", date = ""] = line.split("\t");
+    if (ref.startsWith("refs/heads/")) {
+      let ahead = 0, behind = 0;
+      const am = track.match(/ahead (\d+)/);
+      const bm = track.match(/behind (\d+)/);
+      if (am) ahead = Number(am[1]);
+      if (bm) behind = Number(bm[1]);
+      branches.push({ name: ref.slice("refs/heads/".length), current: head === "*", upstream: up || null, ahead, behind });
+    } else if (ref.startsWith("refs/remotes/")) {
+      const name = ref.slice("refs/remotes/".length);
+      // Skip refs/remotes/<remote>/HEAD and other symrefs.
+      if (!name || symref) continue;
+      const slash = name.indexOf("/");
+      if (slash < 1) continue;
+      remoteBranches.push({ name, remote: name.slice(0, slash), branch: name.slice(slash + 1), sha });
+    } else if (ref.startsWith("refs/tags/")) {
+      tagDates.push({ name: ref.slice("refs/tags/".length), date: Number(date) || 0 });
+    }
   }
-  return out;
+  tagDates.sort((a, b) => b.date - a.date);
+  return { branches, remoteBranches, tags: tagDates.map((t) => t.name) };
+}
+
+export async function branches(root: string): Promise<Branch[]> {
+  return (await refsOf(root)).branches;
 }
 
 export async function remoteBranches(root: string): Promise<RemoteBranch[]> {
-  const fmt = "%(refname:short)\t%(objectname:short)\t%(symref)";
-  const r = await mustRun(root, ["for-each-ref", "--format=" + fmt, "refs/remotes"]);
-  const out: RemoteBranch[] = [];
-  for (const line of r.split("\n")) {
-    if (!line) continue;
-    const [name = "", sha = "", symref = ""] = line.split("\t");
-    if (!name || symref) continue;
-    const slash = name.indexOf("/");
-    if (slash < 1) continue;
-    out.push({ name, remote: name.slice(0, slash), branch: name.slice(slash + 1), sha });
-  }
-  return out;
+  return (await refsOf(root)).remoteBranches;
 }
 
 export async function fetchRemote(root: string, remote: string | null, prune: boolean): Promise<void> {
@@ -758,8 +796,7 @@ export async function stashDiff(root: string, index: number): Promise<DiffPayloa
 }
 
 export async function tags(root: string): Promise<string[]> {
-  const r = await runGit(root, ["tag", "--list", "--sort=-creatordate"]);
-  return r.stdout.split("\n").filter(Boolean);
+  return (await refsOf(root)).tags;
 }
 
 export async function tagCreate(root: string, name: string, message: string, push: boolean): Promise<void> {

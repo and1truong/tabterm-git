@@ -1,11 +1,11 @@
-import { useEffect, useMemo, useState } from "react";
+import { memo, useEffect, useMemo, useState } from "react";
 import type { LogEntry, DiffPayload } from "../../shared.ts";
 import { DiffView } from "./DiffView.tsx";
 
 type CommitDiff = { sha: string; files: DiffPayload[] };
 type HistoryAction = "cherry-pick" | "revert" | "bisect-start";
 
-export function HistoryView({ entries, requestedSha, hasMore, commitDiff, onOpenCommit, onLoadMore, onAction }: {
+export const HistoryView = memo(function HistoryView({ entries, requestedSha, hasMore, commitDiff, onOpenCommit, onLoadMore, onAction }: {
   entries: LogEntry[];
   requestedSha?: string | null;
   hasMore: boolean;
@@ -52,7 +52,7 @@ export function HistoryView({ entries, requestedSha, hasMore, commitDiff, onOpen
       {selected && <Detail entry={selected} commitDiff={commitDiff} onAction={onAction} />}
     </div>
   );
-}
+});
 
 function Row({ row, active, onClick }: { row: GraphRow; active: boolean; onClick: () => void }) {
   const entry = row.entry;

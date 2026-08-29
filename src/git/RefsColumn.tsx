@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import { useHost } from "../useHost.ts";
 import type { GitRefs, Branch, RemoteBranch, Stash, Submodule } from "../../shared.ts";
 
@@ -12,7 +12,7 @@ interface Props {
   onNewBranch: () => void;
 }
 
-export function RefsColumn({ refs, tabId, onManage, onNewTag, onNewBranch }: Props) {
+export const RefsColumn = memo(function RefsColumn({ refs, tabId, onManage, onNewTag, onNewBranch }: Props) {
   const host = useHost();
   const [newBranch, setNewBranch] = useState("");
   const [addingBranch, setAddingBranch] = useState(false);
@@ -229,7 +229,7 @@ export function RefsColumn({ refs, tabId, onManage, onNewTag, onNewBranch }: Pro
       )}
     </div>
   );
-}
+});
 
 function RemoteBranchRow({ branch, onCheckout }: { branch: RemoteBranch; onCheckout: () => void }) {
   return (

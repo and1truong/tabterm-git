@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { memo, useEffect, useState } from "react";
 import type { CommitContext } from "../../shared.ts";
 
 interface Props {
@@ -11,7 +11,7 @@ interface Props {
   onCommit: (message: string, amend: boolean, signoff: boolean, sign: boolean) => void;
 }
 export interface CommitDraft { summary: string; body: string }
-export function CommitComposer(p: Props) {
+export const CommitComposer = memo(function CommitComposer(p: Props) {
   const [summary, setSummary] = useState(p.initialDraft?.summary ?? "");
   const [body, setBody] = useState(p.initialDraft?.body ?? "");
   const [amend, setAmend] = useState(false);
@@ -81,7 +81,7 @@ export function CommitComposer(p: Props) {
       </div>
     </div>
   );
-}
+});
 
 function applyMessage(message: string, setSummary: (value: string) => void, setBody: (value: string) => void) {
   const [summary = "", ...body] = message.trim().split("\n");
