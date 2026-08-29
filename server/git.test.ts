@@ -510,6 +510,46 @@ describe("git.ts: interactive rebase", () => {
     await expect(interactiveRebase(root, "HEAD^", [])).rejects.toThrow(/every commit exactly once/);
     expect(plan.steps).toHaveLength(1);
   });
+
+  test("flattens merge topology without adding merge commits as pick steps", async () => {
+    const root = await makeRepo();
+    await git(root, "branch", "upstream");
+    await git(root, "checkout", "-q", "-b", "topic");
+    await writeFile(join(root, "topic.txt"), "topic\n");
+    await git(root, "add", ".");
+    await git(root, "commit", "-q", "-m", "topic work");
+    await git(root, "checkout", "-q", "main");
+    await writeFile(join(root, "main.txt"), "main\n");
+    await git(root, "add", ".");
+    await git(root, "commit", "-q", "-m", "main work");
+    await git(root, "merge", "-q", "--no-ff", "-m", "merge topic", "topic");
+    const mergeSha = (await runGit(root, ["rev-parse", "HEAD"])).stdout.trim();
+
+    const plan = await rebasePlan(root, "upstream");
+    expect(plan.steps.map(step => step.subject).sort()).toEqual(["main work", "topic work"]);
+    expect(plan.steps.some(step => step.sha === mergeSha)).toBe(false);
+
+    await interactiveRebase(root, "upstream", plan.steps);
+    expect((await status(root)).operation).toBeNull();
+    expect((await runGit(root, ["rev-list", "--merges", "upstream..HEAD"])).stdout.trim()).toBe("");
+    expect(await Bun.file(join(root, "main.txt")).exists()).toBe(true);
+    expect(await Bun.file(join(root, "topic.txt")).exists()).toBe(true);
+  });
+
+  test("rejects oversized plans before presenting an incomplete todo", async () => {
+    const root = await makeRepo();
+    const upstream = (await runGit(root, ["rev-parse", "HEAD"])).stdout.trim();
+    const tree = (await runGit(root, ["rev-parse", "HEAD^{tree}"])).stdout.trim();
+    let parent = upstream;
+    for (let index = 0; index <= 500; index++) {
+      const result = await runGit(root, ["commit-tree", tree, "-p", parent, "-m", `empty ${index}`]);
+      expect(result.exitCode).toBe(0);
+      parent = result.stdout.trim();
+    }
+    await git(root, "update-ref", "refs/heads/main", parent);
+
+    await expect(rebasePlan(root, upstream)).rejects.toThrow(/at most 500 commits; 501 found/);
+  }, 20_000);
 });
 
 describe("git.ts: bisect", () => {

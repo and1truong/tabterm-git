@@ -516,14 +516,37 @@ export async function rebase(root: string, ref: string): Promise<void> {
   await mustRun(root, ["rebase", ref]);
 }
 
-export async function rebasePlan(root: string, upstream: string): Promise<RebasePlan> {
+const MAX_INTERACTIVE_REBASE_COMMITS = 500;
+
+async function interactiveRebaseShas(root: string, upstream: string): Promise<string[]> {
   await mustRun(root, ["rev-parse", "--verify", upstream]);
-  const entries = await log(root, { limit: 500, range: `${upstream}..HEAD` });
-  return { upstream, steps: entries.reverse().map(entry => ({ sha: entry.fullSha, subject: entry.subject, action: "pick" })) };
+  // Plain `git rebase -i` flattens topology and does not put merge commits in
+  // its todo. Mirror that set so we never serialize a merge as an invalid pick.
+  const output = await mustRun(root, ["rev-list", "--reverse", "--no-merges", `${upstream}..HEAD`]);
+  const shas = output.trim().split("\n").filter(Boolean);
+  if (shas.length > MAX_INTERACTIVE_REBASE_COMMITS) {
+    throw new Error(`Interactive rebase supports at most ${MAX_INTERACTIVE_REBASE_COMMITS} commits; ${shas.length} found. Choose a closer upstream.`);
+  }
+  return shas;
+}
+
+export async function rebasePlan(root: string, upstream: string): Promise<RebasePlan> {
+  const shas = await interactiveRebaseShas(root, upstream);
+  if (shas.length === 0) return { upstream, steps: [] };
+  const entries = await log(root, { limit: shas.length, range: `${upstream}..HEAD`, noMerges: true });
+  const bySha = new Map(entries.map(entry => [entry.fullSha, entry]));
+  return {
+    upstream,
+    steps: shas.map(sha => {
+      const entry = bySha.get(sha);
+      if (!entry) throw new Error(`Unable to load rebase commit ${sha.slice(0, 7)}.`);
+      return { sha, subject: entry.subject, action: "pick" };
+    }),
+  };
 }
 
 export async function interactiveRebase(root: string, upstream: string, steps: RebaseStep[]): Promise<string> {
-  const expected = (await mustRun(root, ["rev-list", "--reverse", `${upstream}..HEAD`])).trim().split("\n").filter(Boolean);
+  const expected = await interactiveRebaseShas(root, upstream);
   const supplied = steps.map(step => step.sha);
   if (expected.length === 0) throw new Error(`No commits to rebase onto ${upstream}.`);
   if (supplied.length !== expected.length || new Set(supplied).size !== expected.length || expected.some(sha => !supplied.includes(sha))) {
@@ -749,11 +772,11 @@ export async function tagDelete(root: string, name: string, remote: boolean): Pr
   if (remote) await mustRun(root, ["push", "origin", "--delete", name]);
 }
 
-export async function log(root: string, opts: { limit?: number; all?: boolean; range?: string; path?: string } = {}): Promise<LogEntry[]> {
+export async function log(root: string, opts: { limit?: number; all?: boolean; range?: string; path?: string; noMerges?: boolean } = {}): Promise<LogEntry[]> {
   const limit = opts.limit ?? 200;
   // Custom record sep \x1e + field sep \x1f keep subject + refs intact.
   const fmt = ["%h", "%H", "%P", "%an", "%ae", "%at", "%cn", "%ct", "%s", "%b", "%D", "%G?"].join("%x1f");
-  const r = await runGit(root, ["log", ...(opts.all ? ["--all"] : []), `-n${limit}`, "--date-order", "--no-color", `--pretty=format:${fmt}%x1e`, ...(opts.range ? [opts.range] : []), ...(opts.path ? ["--follow", "--", opts.path] : [])]);
+  const r = await runGit(root, ["log", ...(opts.all ? ["--all"] : []), ...(opts.noMerges ? ["--no-merges"] : []), `-n${limit}`, "--date-order", "--no-color", `--pretty=format:${fmt}%x1e`, ...(opts.range ? [opts.range] : []), ...(opts.path ? ["--follow", "--", opts.path] : [])]);
   if (r.exitCode !== 0) return [];
   const out: LogEntry[] = [];
   for (const rec of r.stdout.split("\x1e")) {
