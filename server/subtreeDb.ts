@@ -56,17 +56,19 @@ export function makeSubtreeDb(db: Database) {
 
   function update(
     id: string,
-    patch: { prefix?: string; remoteUrl?: string; branch?: string; squash?: boolean },
+    patch: { prefix?: string; remoteUrl?: string; branch?: string; squash?: boolean; lastSyncedSha?: string | null; lastSyncedAt?: number | null },
   ): GitSubtree | null {
     const cur = get(id);
     if (!cur) return null;
     db.query(
-      "UPDATE git_subtrees SET prefix = ?, remote_url = ?, branch = ?, squash = ? WHERE id = ?",
+      "UPDATE git_subtrees SET prefix = ?, remote_url = ?, branch = ?, squash = ?, last_synced_sha = ?, last_synced_at = ? WHERE id = ?",
     ).run(
       patch.prefix ?? cur.prefix,
       patch.remoteUrl ?? cur.remoteUrl,
       patch.branch ?? cur.branch,
       (patch.squash ?? cur.squash) ? 1 : 0,
+      patch.lastSyncedSha === undefined ? cur.lastSyncedSha : patch.lastSyncedSha,
+      patch.lastSyncedAt === undefined ? cur.lastSyncedAt : patch.lastSyncedAt,
       id,
     );
     return get(id);

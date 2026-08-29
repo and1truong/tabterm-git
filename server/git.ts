@@ -1,21 +1,49 @@
 import { spawn } from "bun";
-import { realpath, readFile } from "node:fs/promises";
-import { join, resolve as resolvePath, sep } from "node:path";
-import type { FileChange, GitSnapshot, FileCode, DiffPayload, DiffHunk, Branch, Stash, LogEntry, Remote, Submodule } from "../shared.ts";
+import { realpath, readFile, writeFile, stat, lstat, mkdtemp, rm, chmod } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve as resolvePath, sep } from "node:path";
+import type { FileChange, GitSnapshot, FileCode, ConflictCode, GitOperation, GitOperationType, DiffPayload, DiffHunk, ConflictPayload, CommitContext, ComparePayload, ReflogEntry, BlameLine, FileInsightPayload, RebasePlan, RebaseStep, Branch, RemoteBranch, Stash, LogEntry, Remote, Submodule, Worktree } from "../shared.ts";
 
 // Minimum git: status + resolveRoot + the shared spawn helper. The rest of
 // the module is built up over Tasks 4–8 — each adds one logical area.
 
 export interface GitResult { stdout: string; stderr: string; exitCode: number }
+const networkProcesses = new Map<string, ReturnType<typeof spawn>>();
 
-export async function runGit(root: string, args: string[]): Promise<GitResult> {
-  const proc = spawn(["git", "-C", root, ...args], { stdout: "pipe", stderr: "pipe" });
+export async function runGit(root: string, args: string[], env?: Record<string, string>): Promise<GitResult> {
+  const proc = spawn(["git", "-C", root, ...args], { stdout: "pipe", stderr: "pipe", ...(env ? { env: { ...process.env, ...env } } : {}) });
   const [stdout, stderr] = await Promise.all([
     new Response(proc.stdout).text(),
     new Response(proc.stderr).text(),
   ]);
   await proc.exited;
   return { stdout, stderr, exitCode: proc.exitCode ?? 1 };
+}
+
+async function runNetworkGit(root: string, args: string[]): Promise<GitResult> {
+  if (networkProcesses.has(root)) throw new Error("Another network operation is already running for this repository.");
+  const proc = spawn(["git", "-C", root, ...args], { stdout: "pipe", stderr: "pipe" });
+  networkProcesses.set(root, proc);
+  try {
+    const [stdout, stderr] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
+    await proc.exited;
+    return { stdout, stderr, exitCode: proc.exitCode ?? 1 };
+  } finally {
+    if (networkProcesses.get(root) === proc) networkProcesses.delete(root);
+  }
+}
+
+async function mustRunNetwork(root: string, args: string[]): Promise<string> {
+  const result = await runNetworkGit(root, args);
+  if (result.exitCode !== 0) throw new Error(result.stderr.trim() || `git ${args[0]} failed`);
+  return result.stdout;
+}
+
+export function cancelNetwork(root: string): boolean {
+  const process = networkProcesses.get(root);
+  if (!process) return false;
+  process.kill();
+  return true;
 }
 
 export async function resolveRoot(cwd: string): Promise<string | null> {
@@ -32,16 +60,31 @@ export async function resolveRoot(cwd: string): Promise<string | null> {
   return top === resolved ? cwd : top;
 }
 
+export async function initRepository(cwd: string): Promise<string> {
+  // The workspace cwd comes from the trusted host, never from the client. Keep
+  // this idempotent in case two subscribed clients initialize at the same time.
+  const existing = await resolveRoot(cwd);
+  if (existing) return existing;
+  let resolved: string;
+  try { resolved = await realpath(cwd); } catch { throw new Error("Workspace directory does not exist."); }
+  const result = await runGit(resolved, ["init", "-q", "-b", "main"]);
+  if (result.exitCode !== 0) throw new Error(result.stderr.trim() || "Unable to initialize repository.");
+  const root = await resolveRoot(cwd);
+  if (!root) throw new Error("Repository was initialized but could not be opened.");
+  return root;
+}
+
 // Parse `git status --porcelain=v2 --branch -uall`. v2 gives stable fields
 // for renames + submodules and a machine-readable branch header. Submodules
 // appear as `1`/`2` lines with a `XY` worktree-status pair where the X char
 // is one of "?" "M" "C" "U" "N"; we collapse them to a single 'S' code so
 // the UI can show "submodule pointer changed" distinctly from a file edit.
 export async function status(root: string): Promise<GitSnapshot> {
-  const r = await runGit(root, ["status", "--porcelain=v2", "--branch", "-uall"]);
-  if (r.exitCode !== 0) {
-    return emptySnapshot();
-  }
+  const [r, operation] = await Promise.all([
+    runGit(root, ["status", "--porcelain=v2", "--branch", "-uall"]),
+    operationState(root),
+  ]);
+  if (r.exitCode !== 0) throw new Error(r.stderr.trim() || "git status failed");
   const files: FileChange[] = [];
   const staged: FileChange[] = [];
   let branch: string | null = null;
@@ -95,19 +138,78 @@ export async function status(root: string): Promise<GitSnapshot> {
       if (y !== "." && y !== "?") files.push(make(y, false));
       continue;
     }
-    // line starts with "u " → unmerged. Surface as "U" code in unstaged.
+    // line starts with "u " → unmerged. Keep the porcelain XY pair so the
+    // conflict UI can distinguish both-modified from add/delete conflicts.
     if (line.startsWith("u ")) {
       const parts = line.split(" ");
       const path = parts.slice(10).join(" ");
-      files.push({ path, code: "?", staged: false, submodule: false });
+      files.push({
+        path,
+        code: "U",
+        staged: false,
+        submodule: (parts[2] ?? "N...").startsWith("S"),
+        conflict: parts[1] as ConflictCode,
+      });
     }
   }
-  return { branch, detached, headSha, upstream, ahead, behind, files, staged, fetchedAt: Date.now() };
+  return { branch, detached, headSha, upstream, ahead, behind, files, staged, operation, fetchedAt: Date.now() };
+}
+
+async function operationState(root: string): Promise<GitOperation | null> {
+  const rebaseMerge = await gitPath(root, "rebase-merge");
+  if (await exists(rebaseMerge)) {
+    return {
+      type: "rebase",
+      current: await readInt(join(rebaseMerge, "msgnum")),
+      total: await readInt(join(rebaseMerge, "end")),
+    };
+  }
+  const rebaseApply = await gitPath(root, "rebase-apply");
+  if (await exists(rebaseApply)) {
+    return {
+      type: "rebase",
+      current: await readInt(join(rebaseApply, "next")),
+      total: await readInt(join(rebaseApply, "last")),
+    };
+  }
+  for (const [type, ref] of [
+    ["merge", "MERGE_HEAD"],
+    ["cherry-pick", "CHERRY_PICK_HEAD"],
+    ["revert", "REVERT_HEAD"],
+  ] as const) {
+    if ((await runGit(root, ["rev-parse", "-q", "--verify", ref])).exitCode === 0) {
+      return { type, current: null, total: null };
+    }
+  }
+  if ((await runGit(root, ["rev-parse", "-q", "--verify", "refs/bisect/bad"])).exitCode === 0) {
+    return { type: "bisect", current: null, total: null };
+  }
+  return null;
+}
+
+async function gitPath(root: string, name: string): Promise<string> {
+  const r = await runGit(root, ["rev-parse", "--git-path", name]);
+  const path = r.stdout.trim();
+  return resolvePath(root, path);
+}
+
+async function exists(path: string): Promise<boolean> {
+  try { await stat(path); return true; }
+  catch { return false; }
+}
+
+async function readInt(path: string): Promise<number | null> {
+  try {
+    const value = Number((await readFile(path, "utf8")).trim());
+    return Number.isFinite(value) ? value : null;
+  } catch {
+    return null;
+  }
 }
 
 export async function diff(root: string, path: string, staged: boolean): Promise<DiffPayload> {
   const r = await runGit(root, [
-    "diff", staged ? "--cached" : "HEAD", "--no-color", "--unified=3", "--", path,
+    "diff", ...(staged ? ["--cached"] : []), "--no-color", "--unified=3", "--", path,
   ]);
   // Untracked files produce no diff; fall back to `--no-index /dev/null path`.
   let stdout = r.stdout;
@@ -116,6 +218,48 @@ export async function diff(root: string, path: string, staged: boolean): Promise
     stdout = r2.stdout;
   }
   return parseDiff(stdout, path, staged);
+}
+
+export async function conflictFile(root: string, path: string): Promise<ConflictPayload> {
+  const target = await safeWorktreePath(root, path);
+  const [base, ours, theirs, result] = await Promise.all([
+    conflictStage(root, 1, path),
+    conflictStage(root, 2, path),
+    conflictStage(root, 3, path),
+    readFile(target, "utf8").catch(() => ""),
+  ]);
+  const values = [base, ours, theirs, result].filter((v): v is string => v !== null);
+  return { path, base, ours, theirs, result, isBinary: values.some(v => v.includes("\0")) };
+}
+
+export async function saveConflictResolution(root: string, path: string, content: string): Promise<void> {
+  const target = await safeWorktreePath(root, path);
+  await writeFile(target, content);
+  await stage(root, [path]);
+}
+
+export async function deleteConflictResolution(root: string, path: string): Promise<void> {
+  await safeWorktreePath(root, path);
+  await mustRun(root, ["rm", "--", path]);
+}
+
+async function conflictStage(root: string, stage: 1 | 2 | 3, path: string): Promise<string | null> {
+  const r = await runGit(root, ["show", `:${stage}:${path}`]);
+  return r.exitCode === 0 ? r.stdout : null;
+}
+
+async function safeWorktreePath(root: string, path: string): Promise<string> {
+  const rootPath = await realpath(root);
+  const target = resolvePath(rootPath, path);
+  if (target === rootPath || !target.startsWith(rootPath + sep)) throw new Error("Invalid repository path.");
+  const parent = await realpath(dirname(target));
+  if (parent !== rootPath && !parent.startsWith(rootPath + sep)) throw new Error("Repository path escapes through a symlink.");
+  try {
+    if ((await lstat(target)).isSymbolicLink()) throw new Error("Conflict resolution for symlinks is not supported in the editor.");
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
+  }
+  return target;
 }
 
 function parseDiff(out: string, path: string, staged: boolean): DiffPayload {
@@ -147,6 +291,18 @@ function parseDiff(out: string, path: string, staged: boolean): DiffPayload {
 export async function commitDiff(root: string, sha: string): Promise<DiffPayload[]> {
   const r = await runGit(root, ["show", sha, "--no-color", "--format=", "--unified=3"]);
   return parseCommitDiff(r.stdout);
+}
+
+export async function compareRefs(root: string, base: string, head: string): Promise<ComparePayload> {
+  await mustRun(root, ["rev-parse", "--verify", base]);
+  await mustRun(root, ["rev-parse", "--verify", head]);
+  const [counts, commits, changes] = await Promise.all([
+    mustRun(root, ["rev-list", "--left-right", "--count", `${base}...${head}`]),
+    log(root, { limit: 500, range: `${base}..${head}` }),
+    mustRun(root, ["diff", "--no-color", "--unified=3", `${base}...${head}`]),
+  ]);
+  const [behind = 0, ahead = 0] = counts.trim().split(/\s+/).map(Number);
+  return { base, head, ahead, behind, commits, files: parseCommitDiff(changes) };
 }
 
 // `git show` concatenates per-file diffs; split on each `diff --git` header and
@@ -200,7 +356,27 @@ export async function discard(root: string, paths: string[]): Promise<void> {
   });
 }
 
-export async function stageHunk(root: string, patch: string, reverse: boolean): Promise<void> {
+export async function ignore(root: string, paths: string[]): Promise<void> {
+  if (!paths.length) return;
+  const ignorePath = join(root, ".gitignore");
+  const current = await readFile(ignorePath, "utf8").catch(() => "");
+  const existing = new Set(current.split("\n"));
+  const additions = paths.map(exactIgnorePattern).filter(pattern => !existing.has(pattern));
+  if (!additions.length) return;
+  const prefix = current && !current.endsWith("\n") ? "\n" : "";
+  await writeFile(ignorePath, current + prefix + additions.join("\n") + "\n");
+}
+
+function exactIgnorePattern(path: string): string {
+  if (path.includes("\n") || path.includes("\r")) throw new Error("Paths containing newlines cannot be added to .gitignore.");
+  return "/" + path.replace(/([\\*?\[\]])/g, "\\$1");
+}
+
+export async function stageHunk(root: string, patch: string, reverse: boolean, path?: string): Promise<void> {
+  if (!reverse && path) {
+    const tracked = await runGit(root, ["ls-files", "--error-unmatch", "--", path]);
+    if (tracked.exitCode !== 0) await mustRun(root, ["add", "--intent-to-add", "--", path]);
+  }
   const proc = spawn(["git", "-C", root, "apply", "--cached", "--unidiff-zero", ...(reverse ? ["--reverse"] : []), "-"], {
     stdin: "pipe", stdout: "pipe", stderr: "pipe",
   });
@@ -211,10 +387,31 @@ export async function stageHunk(root: string, patch: string, reverse: boolean): 
   if (proc.exitCode !== 0) throw new Error(err.trim() || "git apply failed");
 }
 
-export async function commit(root: string, message: string, amend: boolean): Promise<{ sha: string }> {
-  await mustRun(root, ["commit", ...(amend ? ["--amend"] : []), "-m", message]);
+export async function commit(root: string, message: string, amend: boolean, signoff = false, sign = false): Promise<{ sha: string }> {
+  await mustRun(root, ["commit", ...(amend ? ["--amend"] : []), ...(signoff ? ["--signoff"] : []), ...(sign ? ["--gpg-sign"] : []), "-m", message]);
   const sha = (await mustRun(root, ["rev-parse", "--short", "HEAD"])).trim();
   return { sha };
+}
+
+export async function commitContext(root: string): Promise<CommitContext> {
+  const [ident, head, templatePath, signing] = await Promise.all([
+    runGit(root, ["var", "GIT_AUTHOR_IDENT"]),
+    runGit(root, ["log", "-1", "--format=%B"]),
+    runGit(root, ["config", "--path", "--get", "commit.template"]),
+    runGit(root, ["config", "--bool", "--get", "commit.gpgSign"]),
+  ]);
+  const match = ident.stdout.trim().match(/^(.*) <([^>]*)> \d+ [+-]\d+$/);
+  const configuredPath = templatePath.stdout.trim();
+  const template = configuredPath
+    ? await readFile(resolvePath(root, configuredPath), "utf8").catch(() => null)
+    : null;
+  return {
+    authorName: match?.[1] ?? "",
+    authorEmail: match?.[2] ?? "",
+    headMessage: head.exitCode === 0 ? head.stdout.trim() : "",
+    template,
+    signingEnabled: signing.stdout.trim() === "true",
+  };
 }
 
 export async function branches(root: string): Promise<Branch[]> {
@@ -235,8 +432,226 @@ export async function branches(root: string): Promise<Branch[]> {
   return out;
 }
 
+export async function remoteBranches(root: string): Promise<RemoteBranch[]> {
+  const fmt = "%(refname:short)\t%(objectname:short)\t%(symref)";
+  const r = await mustRun(root, ["for-each-ref", "--format=" + fmt, "refs/remotes"]);
+  const out: RemoteBranch[] = [];
+  for (const line of r.split("\n")) {
+    if (!line) continue;
+    const [name = "", sha = "", symref = ""] = line.split("\t");
+    if (!name || symref) continue;
+    const slash = name.indexOf("/");
+    if (slash < 1) continue;
+    out.push({ name, remote: name.slice(0, slash), branch: name.slice(slash + 1), sha });
+  }
+  return out;
+}
+
+export async function fetchRemote(root: string, remote: string | null, prune: boolean): Promise<void> {
+  await mustRunNetwork(root, ["fetch", ...(prune ? ["--prune"] : []), ...(remote ? [remote] : ["--all"])]);
+}
+
+export async function pull(root: string, strategy: "ff-only" | "merge" | "rebase"): Promise<void> {
+  const flag = strategy === "ff-only" ? "--ff-only" : strategy === "rebase" ? "--rebase" : "--no-rebase";
+  await mustRunNetwork(root, ["pull", flag]);
+}
+
+export async function operationAction(root: string, action: "continue" | "skip" | "abort"): Promise<void> {
+  const operation = (await status(root)).operation;
+  if (!operation) throw new Error("No merge, rebase, cherry-pick, or revert is in progress.");
+  const command = operationCommand(operation.type, action);
+  await mustRun(root, ["-c", "core.editor=true", command, `--${action}`]);
+}
+
+export async function bisect(root: string, action: "start" | "good" | "bad" | "skip" | "reset", good?: string, bad = "HEAD"): Promise<void> {
+  if (action === "start") {
+    if (!good) throw new Error("Choose a known-good commit to start bisect.");
+    await mustRun(root, ["bisect", "start", bad, good]);
+  } else {
+    await mustRun(root, ["bisect", action]);
+  }
+}
+
+export async function cherryPick(root: string, shas: string[]): Promise<void> {
+  if (!shas.length) return;
+  await mustRun(root, ["cherry-pick", ...shas]);
+}
+
+export async function revert(root: string, sha: string): Promise<void> {
+  await mustRun(root, ["revert", "--no-edit", sha]);
+}
+
+export async function merge(root: string, ref: string, noFf = false): Promise<void> {
+  await mustRun(root, ["merge", "--no-edit", ...(noFf ? ["--no-ff"] : []), ref]);
+}
+
+export async function rebase(root: string, ref: string): Promise<void> {
+  await mustRun(root, ["rebase", ref]);
+}
+
+export async function rebasePlan(root: string, upstream: string): Promise<RebasePlan> {
+  await mustRun(root, ["rev-parse", "--verify", upstream]);
+  const entries = await log(root, { limit: 500, range: `${upstream}..HEAD` });
+  return { upstream, steps: entries.reverse().map(entry => ({ sha: entry.fullSha, subject: entry.subject, action: "pick" })) };
+}
+
+export async function interactiveRebase(root: string, upstream: string, steps: RebaseStep[]): Promise<string> {
+  const expected = (await mustRun(root, ["rev-list", "--reverse", `${upstream}..HEAD`])).trim().split("\n").filter(Boolean);
+  const supplied = steps.map(step => step.sha);
+  if (expected.length === 0) throw new Error(`No commits to rebase onto ${upstream}.`);
+  if (supplied.length !== expected.length || new Set(supplied).size !== expected.length || expected.some(sha => !supplied.includes(sha))) {
+    throw new Error("Rebase plan must contain every commit exactly once.");
+  }
+  if (steps[0]?.action !== "pick" || steps.some(step => !["pick", "squash", "fixup"].includes(step.action))) {
+    throw new Error("The first commit must be picked; supported actions are pick, squash, and fixup.");
+  }
+  const head = (await mustRun(root, ["rev-parse", "HEAD"])).trim();
+  const safetyRef = `refs/tabterm/safety/${Date.now()}-${head.slice(0, 7)}`;
+  await mustRun(root, ["update-ref", safetyRef, head]);
+  const temp = await mkdtemp(join(tmpdir(), "tabterm-rebase-"));
+  try {
+    const todo = join(temp, "todo");
+    const editor = join(temp, "sequence-editor.sh");
+    await writeFile(todo, steps.map(step => `${step.action} ${step.sha} ${step.subject.replace(/[\r\n]/g, " ")}`).join("\n") + "\n");
+    await writeFile(editor, "#!/bin/sh\ncp \"$TABTERM_REBASE_TODO\" \"$1\"\n");
+    await chmod(editor, 0o700);
+    const result = await runGit(root, ["rebase", "-i", upstream], {
+      GIT_SEQUENCE_EDITOR: editor,
+      GIT_EDITOR: "true",
+      TABTERM_REBASE_TODO: todo,
+    });
+    if (result.exitCode !== 0) throw new Error(result.stderr.trim() || "Interactive rebase stopped.");
+    return safetyRef;
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+}
+
+export async function reflog(root: string, limit = 200): Promise<ReflogEntry[]> {
+  const fmt = ["%gd", "%h", "%H", "%gs", "%ct"].join("%x1f");
+  const r = await runGit(root, ["reflog", "show", `-n${limit}`, `--format=${fmt}%x1e`]);
+  if (r.exitCode !== 0) return [];
+  return r.stdout.split("\x1e").flatMap(record => {
+    const value = record.trim();
+    if (!value) return [];
+    const [selector = "", sha = "", fullSha = "", subject = "", timestamp = ""] = value.split("\x1f");
+    const colon = subject.indexOf(":");
+    return [{
+      selector,
+      sha,
+      fullSha,
+      action: colon >= 0 ? subject.slice(0, colon) : subject,
+      message: colon >= 0 ? subject.slice(colon + 1).trim() : "",
+      at: Number(timestamp) * 1000,
+    }];
+  });
+}
+
+export async function resetTo(root: string, ref: string, mode: "soft" | "mixed"): Promise<string> {
+  if (mode !== "soft" && mode !== "mixed") throw new Error("Only soft and mixed reset are supported; both preserve working-tree files.");
+  await mustRun(root, ["rev-parse", "--verify", ref]);
+  const head = (await mustRun(root, ["rev-parse", "HEAD"])).trim();
+  const safetyRef = `refs/tabterm/safety/${Date.now()}-${head.slice(0, 7)}`;
+  await mustRun(root, ["update-ref", safetyRef, head]);
+  await mustRun(root, ["reset", `--${mode}`, ref]);
+  return safetyRef;
+}
+
+export async function recoverBranch(root: string, ref: string): Promise<string> {
+  const sha = (await mustRun(root, ["rev-parse", "--verify", ref])).trim();
+  const base = `recovery/${sha.slice(0, 7)}`;
+  let name = base;
+  let suffix = 2;
+  while ((await runGit(root, ["show-ref", "--verify", "--quiet", `refs/heads/${name}`])).exitCode === 0) name = `${base}-${suffix++}`;
+  await mustRun(root, ["branch", name, sha]);
+  return name;
+}
+
+export async function worktrees(root: string): Promise<Worktree[]> {
+  const r = await mustRun(root, ["worktree", "list", "--porcelain", "-z"]);
+  return r.split("\0\0").flatMap(record => {
+    const fields = record.split("\0").filter(Boolean);
+    const path = valueFor(fields, "worktree ");
+    if (!path) return [];
+    const branchRef = valueFor(fields, "branch ");
+    return [{
+      path,
+      head: valueFor(fields, "HEAD "),
+      branch: branchRef?.replace(/^refs\/heads\//, "") ?? null,
+      bare: fields.includes("bare"),
+      detached: fields.includes("detached"),
+      locked: valueFor(fields, "locked ") ?? (fields.includes("locked") ? "" : null),
+      prunable: valueFor(fields, "prunable ") ?? (fields.includes("prunable") ? "" : null),
+    }];
+  });
+}
+
+function valueFor(fields: string[], prefix: string): string | null {
+  const field = fields.find(value => value.startsWith(prefix));
+  return field ? field.slice(prefix.length) : null;
+}
+
+export async function worktreeAdd(root: string, path: string, ref: string, newBranch: string | null): Promise<void> {
+  await mustRun(root, ["worktree", "add", ...(newBranch ? ["-b", newBranch] : []), path, ref]);
+}
+
+export async function worktreeRemove(root: string, path: string): Promise<void> {
+  await mustRun(root, ["worktree", "remove", path]);
+}
+
+export async function worktreeLock(root: string, path: string, lock: boolean, reason?: string): Promise<void> {
+  await mustRun(root, ["worktree", lock ? "lock" : "unlock", ...(lock && reason ? ["--reason", reason] : []), path]);
+}
+
+export async function worktreePrune(root: string): Promise<void> {
+  await mustRun(root, ["worktree", "prune"]);
+}
+
+export async function fileInsight(root: string, path: string): Promise<FileInsightPayload> {
+  const [blameResult, history] = await Promise.all([
+    runGit(root, ["blame", "--line-porcelain", "--", path]),
+    log(root, { limit: 500, path }),
+  ]);
+  return { path, blame: blameResult.exitCode === 0 ? parseBlame(blameResult.stdout) : [], history };
+}
+
+export function parseBlame(output: string): BlameLine[] {
+  const lines = output.split("\n");
+  const result: BlameLine[] = [];
+  for (let index = 0; index < lines.length;) {
+    const header = lines[index]?.match(/^([0-9a-f^]{40}) \d+ (\d+)(?: \d+)?$/);
+    if (!header) { index++; continue; }
+    const sha = header[1]!.replace(/^\^/, "");
+    const line = Number(header[2]);
+    let author = "", authorEmail = "", authoredAt = 0, summary = "", content = "";
+    index++;
+    while (index < lines.length && !lines[index]!.startsWith("\t")) {
+      const value = lines[index++]!;
+      if (value.startsWith("author ")) author = value.slice(7);
+      else if (value.startsWith("author-mail ")) authorEmail = value.slice(12).replace(/^<|>$/g, "");
+      else if (value.startsWith("author-time ")) authoredAt = Number(value.slice(12)) * 1000;
+      else if (value.startsWith("summary ")) summary = value.slice(8);
+    }
+    if (lines[index]?.startsWith("\t")) content = lines[index++]!.slice(1);
+    result.push({ line, sha, author, authorEmail, authoredAt, summary, content });
+  }
+  return result;
+}
+
+function operationCommand(type: GitOperationType, action: "continue" | "skip" | "abort"): string {
+  if (type === "bisect") throw new Error("Use the bisect controls to mark the current commit or end the bisect.");
+  if (action === "skip" && type === "merge") throw new Error("A merge cannot skip a commit. Resolve it or abort the merge.");
+  return type;
+}
+
 export async function checkout(root: string, name: string): Promise<void> {
   await mustRun(root, ["checkout", name]);
+}
+
+export async function checkoutRemote(root: string, name: string, localName: string): Promise<void> {
+  const local = await runGit(root, ["show-ref", "--verify", "--quiet", `refs/heads/${localName}`]);
+  if (local.exitCode === 0) await mustRun(root, ["checkout", localName]);
+  else await mustRun(root, ["checkout", "--track", "-b", localName, name]);
 }
 
 export async function branchCreate(root: string, name: string, from: string | null, checkout: boolean): Promise<void> {
@@ -251,7 +666,7 @@ export async function branchDelete(root: string, name: string, force: boolean): 
 
 export async function push(root: string, branch: string, remote: string, setUpstream: boolean): Promise<void> {
   const args = setUpstream ? ["push", "-u", remote, branch] : ["push", remote, branch];
-  const r = await runGit(root, args);
+  const r = await runNetworkGit(root, args);
   if (r.exitCode !== 0) {
     const err = r.stderr.trim();
     if (/\[rejected\]|non-fast-forward|fetch first/i.test(err)) {
@@ -275,8 +690,8 @@ export async function stashes(root: string): Promise<Stash[]> {
   return out;
 }
 
-export async function stashCreate(root: string, message: string): Promise<void> {
-  await mustRun(root, message ? ["stash", "push", "-m", message] : ["stash", "push"]);
+export async function stashCreate(root: string, message: string, opts: { includeUntracked?: boolean; keepIndex?: boolean; stagedOnly?: boolean } = {}): Promise<void> {
+  await mustRun(root, ["stash", "push", ...(message ? ["-m", message] : []), ...(opts.includeUntracked ? ["--include-untracked"] : []), ...(opts.keepIndex ? ["--keep-index"] : []), ...(opts.stagedOnly ? ["--staged"] : [])]);
 }
 
 export async function stashApply(root: string, index: number, pop: boolean): Promise<void> {
@@ -285,6 +700,11 @@ export async function stashApply(root: string, index: number, pop: boolean): Pro
 
 export async function stashDrop(root: string, index: number): Promise<void> {
   await mustRun(root, ["stash", "drop", `stash@{${index}}`]);
+}
+
+export async function stashDiff(root: string, index: number): Promise<DiffPayload[]> {
+  const output = await mustRun(root, ["stash", "show", "--patch", "--include-untracked", `stash@{${index}}`]);
+  return parseCommitDiff(output);
 }
 
 export async function tags(root: string): Promise<string[]> {
@@ -302,26 +722,30 @@ export async function tagDelete(root: string, name: string, remote: boolean): Pr
   if (remote) await mustRun(root, ["push", "origin", "--delete", name]);
 }
 
-export async function log(root: string, opts: { limit?: number } = {}): Promise<LogEntry[]> {
+export async function log(root: string, opts: { limit?: number; all?: boolean; range?: string; path?: string } = {}): Promise<LogEntry[]> {
   const limit = opts.limit ?? 200;
   // Custom record sep \x1e + field sep \x1f keep subject + refs intact.
-  const fmt = ["%h", "%H", "%P", "%an", "%ae", "%at", "%s", "%D"].join("%x1f");
-  const r = await runGit(root, ["log", `-n${limit}`, "--no-color", `--pretty=format:${fmt}%x1e`]);
+  const fmt = ["%h", "%H", "%P", "%an", "%ae", "%at", "%cn", "%ct", "%s", "%b", "%D", "%G?"].join("%x1f");
+  const r = await runGit(root, ["log", ...(opts.all ? ["--all"] : []), `-n${limit}`, "--date-order", "--no-color", `--pretty=format:${fmt}%x1e`, ...(opts.range ? [opts.range] : []), ...(opts.path ? ["--follow", "--", opts.path] : [])]);
   if (r.exitCode !== 0) return [];
   const out: LogEntry[] = [];
   for (const rec of r.stdout.split("\x1e")) {
     const t = rec.trim();
     if (!t) continue;
-    const [sha, fullSha, parents, author, email, ts, subject, refs] = t.split("\x1f");
+    const [sha, fullSha, parents, author, email, authoredTs, committer, committedTs, subject, body, refs, signature] = t.split("\x1f");
     out.push({
       sha: sha ?? "",
       fullSha: fullSha ?? "",
       parents: (parents ?? "").split(" ").filter(Boolean).map(p => p.slice(0, 7)),
       author: author ?? "",
       authorEmail: email ?? "",
-      authoredAt: Number(ts) * 1000,
+      authoredAt: Number(authoredTs) * 1000,
+      committer: committer ?? "",
+      committedAt: Number(committedTs) * 1000,
       subject: subject ?? "",
+      body: body?.trim() ?? "",
       refs: (refs ?? "").split(",").map(s => s.trim()).filter(Boolean),
+      signature: (signature || "N") as LogEntry["signature"],
     });
   }
   return out;
@@ -399,9 +823,21 @@ export async function submodules(root: string): Promise<Submodule[]> {
   return out;
 }
 
-function emptySnapshot(): GitSnapshot {
-  return {
-    branch: null, detached: false, headSha: null, upstream: null,
-    ahead: null, behind: null, files: [], staged: [], fetchedAt: Date.now(),
-  };
+export async function submoduleUpdateRemote(root: string, path: string): Promise<void> {
+  await mustRunNetwork(root, ["submodule", "update", "--init", "--remote", "--", path]);
+}
+
+export async function subtreeSync(root: string, subtree: { prefix: string; remoteUrl: string; branch: string; squash: boolean }, direction: "pull" | "push"): Promise<string> {
+  for (const value of [subtree.prefix, subtree.remoteUrl, subtree.branch]) {
+    if (!value || value.startsWith("-")) throw new Error("Invalid subtree configuration.");
+  }
+  const squash = subtree.squash ? ["--squash"] : [];
+  if (direction === "push") {
+    await mustRunNetwork(root, ["subtree", "push", `--prefix=${subtree.prefix}`, subtree.remoteUrl, subtree.branch]);
+  } else if (await exists(join(root, subtree.prefix))) {
+    await mustRunNetwork(root, ["subtree", "pull", `--prefix=${subtree.prefix}`, subtree.remoteUrl, subtree.branch, ...squash]);
+  } else {
+    await mustRunNetwork(root, ["subtree", "add", `--prefix=${subtree.prefix}`, subtree.remoteUrl, subtree.branch, ...squash]);
+  }
+  return (await mustRun(root, ["rev-parse", "HEAD"])).trim();
 }

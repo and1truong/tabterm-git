@@ -7,8 +7,14 @@ export interface RailPage { id: string; icon: ReactNode; label: string; componen
 export interface SidebarPanel { id: string; icon: ReactNode; label: string; component: ComponentType<any> }
 // `visible` lets an action gate itself (e.g. show only on the session view).
 // The host filters on it; omitted → always shown.
-export interface TabBarAction { id: string; icon: ReactNode; tooltip: string; onClick: () => void; visible?: () => boolean }
-export interface HeaderItem { id: string; component: ComponentType<any> }
+// `weight` orders items within their slot (ascending, default 0); ties keep
+// registration order. Use a large weight to sit last (far right), negative to
+// sit first — see HeaderItem.
+export interface TabBarAction { id: string; icon: ReactNode; tooltip: string; onClick: () => void; visible?: () => boolean; weight?: number }
+// `weight` orders header items within the top-chrome cluster (ascending,
+// default 0); ties keep registration order, so unweighted items stay in load
+// order. A high weight sinks the item to the far right of the module chips.
+export interface HeaderItem { id: string; component: ComponentType<any>; weight?: number }
 export type FooterItem = HeaderItem;
 export interface FloatingBox { id: string; component: ComponentType<any> }
 // `visible` lets a panel declare when it has anything to show. The host gates the
@@ -25,10 +31,45 @@ export interface PaletteAction { id: string; title: string; run: () => void }
 // default when the combo matches, before its own built-in shortcuts.
 export interface ShortcutSpec { id: string; key: string; shift?: boolean; run: () => void }
 
+export const OPEN_FILE_CAPABILITY = "open-file/v1";
+
+export interface OpenFileRequest {
+  workspaceId: string;
+  path: string;
+}
+
+export interface OpenFileValue {
+  viewId: string;
+}
+
+export type CapabilityHandlerResult<T> =
+  | { handled: true; value: T }
+  | { handled: false; reason: string };
+
+export interface CapabilityAttempt {
+  providerId: string;
+  reason: string;
+}
+
+export type CapabilityInvocation<T> =
+  | { handled: true; providerId: string; value: T }
+  | { handled: false; reason: "unavailable" | "declined"; attempts: CapabilityAttempt[] };
+
 export interface ThemeInfo {
   mode: "dark" | "light";
   accent: string;
   colors: Record<string, string>;
+}
+
+export interface DiagramEditorProps {
+  content: string;
+  onChange(content: string): void;
+}
+
+export interface DiagramIntegration {
+  Editor: ComponentType<DiagramEditorProps>;
+  icon: ReactNode;
+  summarize(content: string): string;
 }
 
 export interface ModuleContext {
@@ -110,9 +151,26 @@ export interface UIElements {
   modal?: OneOrMany<ModalSpec>;
 }
 
+export interface ModuleNavigation {
+  // Decoded, module-owned URL segments after /<workspace>/<module-id>.
+  path(): string[];
+  navigate(path: readonly string[], options?: { replace?: boolean }): void;
+  subscribe(cb: (path: string[]) => void): () => void;
+}
+
 export interface ClientHost {
   id: string;
-  config: unknown;
+  notes?: {
+    apiVersion: 1;
+    registerDiagram(spec: DiagramIntegration): () => void;
+  };
+  /**
+   * @deprecated Never populated — the host has no per-module client-config
+   * channel and always passed `undefined`. Use `host.settings` for
+   * schema-validated module config. Kept optional for one contract version so
+   * external modules that mention the field keep compiling; will be removed.
+   */
+  config?: unknown;
   ui: {
     // Mount one or more UI elements in a single call and get ONE teardown back:
     // calling the returned fn unregisters everything this call registered, in
@@ -135,7 +193,24 @@ export interface ClientHost {
     // its own teardown) rather than living under registerUI's element map.
     registerPaletteAction(p: PaletteAction): () => void;
     registerShortcut(p: ShortcutSpec): () => void;
+    // Feature detection only: true when a matching rail page is registered.
+    hasRailPage(id: string): boolean;
   };
+  // Optional module-to-module interoperability. Providers are tried in stable
+  // module-id order until one handles the request; a decline must not mutate
+  // state so the next provider can safely run.
+  capabilities: {
+    provide<I, O>(
+      name: string,
+      handler: (input: I) => CapabilityHandlerResult<O> | Promise<CapabilityHandlerResult<O>>,
+    ): () => void;
+    has(name: string): boolean;
+    subscribe(name: string, cb: (available: boolean) => void): () => void;
+    invoke<I, O>(name: string, input: I): Promise<CapabilityInvocation<O>>;
+  };
+  // Module-scoped browser navigation. The core owns workspace/view URL segments;
+  // a module owns only the path that follows its rail-page id.
+  navigation: ModuleNavigation;
   // Subscribe to a server module:event (the matching host.broadcast on the
   // server). This is the live-update path: render from what arrives here, not
   // from an rpc.call return. Typical pattern — seed once with a getState rpc,
@@ -164,6 +239,9 @@ export interface ClientHost {
     playChime(soundId: string, volume: number): void;
     notify(opts: { title: string; body?: string }): void;
     attention(sessionId: string): void;
+    // Jump the UI to a session (sidebar selection + terminal focus) — the same
+    // action an attention-toast click performs.
+    focusSession(sessionId: string): void;
   };
   kv: {
     get(key: string): unknown;
@@ -182,7 +260,11 @@ export interface ClientHost {
     schema(): JsonSchema | null;
   };
   store: {
-    use<T>(selector: (s: Record<string, Record<string, any>>) => T): T;
+    // React hook over the module's own synced store. Pass `eq` (e.g. shallowEqual)
+    // whenever the selector returns a FRESH object/array each call — without it the
+    // default Object.is sees a new reference every render and loops (React #185).
+    // Selecting a stable bucket and deriving in useMemo works too.
+    use<T>(selector: (s: Record<string, Record<string, any>>) => T, eq?: EqualityFn<T>): T;
     getState(): Record<string, Record<string, any>>;
     setState(fn: (s: Record<string, Record<string, any>>) => Record<string, Record<string, any>>): void;
     patch(p: { entity: string; op: "set" | "delete"; data?: any; id?: string }): void;

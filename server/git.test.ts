@@ -1,9 +1,10 @@
 import { describe, test, expect, beforeAll } from "bun:test";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, writeFile, realpath } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "bun";
-import { resolveRoot, status, runGit, diff, commitDiff, stage, unstage, discard, commit, branches, checkout, branchCreate, branchDelete, stashes, stashCreate, stashDrop, log, tags, tagCreate, remotes, remoteAdd, remoteUpdate, remoteRemove, submodules, push } from "./git.ts";
+import { resolveRoot, initRepository, status, runGit, diff, conflictFile, saveConflictResolution, commitDiff, compareRefs, fileInsight, stage, stageHunk, unstage, discard, ignore, commit, commitContext, branches, remoteBranches, checkout, branchCreate, branchDelete, merge, rebase, rebasePlan, interactiveRebase, cherryPick, revert, bisect, reflog, resetTo, recoverBranch, worktrees, worktreeAdd, worktreeRemove, worktreeLock, stashes, stashCreate, stashDiff, stashDrop, log, tags, tagCreate, remotes, remoteAdd, remoteUpdate, remoteRemove, submodules, subtreeSync, fetchRemote, pull, push, operationAction } from "./git.ts";
+import { serializeSelectedLines } from "../src/git/patch.ts";
 
 async function git(cwd: string, ...args: string[]): Promise<void> {
   const p = spawn(["git", "-C", cwd, ...args], { stdout: "ignore", stderr: "ignore" });
@@ -33,6 +34,16 @@ describe("git.ts: resolveRoot + status", () => {
   test("resolveRoot outside a repo returns null", async () => {
     const d = await mkdtemp(join(tmpdir(), "tabterm-norepo-"));
     expect(await resolveRoot(d)).toBeNull();
+    await rm(d, { recursive: true, force: true });
+  });
+
+  test("initRepository creates an empty main-branch repository", async () => {
+    const d = await mkdtemp(join(tmpdir(), "tabterm-init-"));
+    expect(await initRepository(d)).toBe(d);
+    const snap = await status(d);
+    expect(snap.branch).toBe("main");
+    expect(snap.headSha).toBeNull();
+    expect(await initRepository(d)).toBe(d);
     await rm(d, { recursive: true, force: true });
   });
 
@@ -81,6 +92,110 @@ describe("git.ts: diff", () => {
     const d = await diff(root, "README.md", false);
     const lines = d.hunks.flatMap(h => h.lines);
     expect(lines.some(l => l.noNewline)).toBe(true);
+  });
+
+  test("unstaged diff excludes changes already staged in the same file", async () => {
+    const root = await makeRepo();
+    await writeFile(join(root, "lines.txt"), "one\ntwo\nthree\n");
+    await git(root, "add", "lines.txt");
+    await git(root, "commit", "-q", "-m", "add lines");
+
+    await writeFile(join(root, "lines.txt"), "ONE\ntwo\nthree\n");
+    await git(root, "add", "lines.txt");
+    await writeFile(join(root, "lines.txt"), "ONE\nTWO\nthree\n");
+
+    const staged = await diff(root, "lines.txt", true);
+    const unstaged = await diff(root, "lines.txt", false);
+    const text = (d: typeof staged) => d.hunks.flatMap(h => h.lines.map(l => `${l.kind}${l.src}`)).join("\n");
+    expect(text(staged)).toContain("+ONE");
+    expect(text(staged)).not.toContain("+TWO");
+    expect(text(unstaged)).toContain("+TWO");
+    expect(text(unstaged)).not.toContain("+ONE");
+  });
+
+  test("stages one selected line without staging another change in the hunk", async () => {
+    const root = await makeRepo();
+    await writeFile(join(root, "lines.txt"), "one\ntwo\nthree\nfour\nfive\n");
+    await git(root, "add", "lines.txt");
+    await git(root, "commit", "-q", "-m", "add lines");
+    await writeFile(join(root, "lines.txt"), "ONE\ntwo\nthree\nFOUR\nfive\n");
+    const change = await diff(root, "lines.txt", false);
+    const hunk = change.hunks[0]!;
+    const line = hunk.lines.findIndex(item => item.kind === "+" && item.src === "ONE");
+    const patch = serializeSelectedLines(hunk, "lines.txt", new Set([line]));
+    expect(patch).not.toBeNull();
+
+    await stageHunk(root, patch!, false, "lines.txt");
+
+    const stagedText = (await diff(root, "lines.txt", true)).hunks.flatMap(h => h.lines.map(l => `${l.kind}${l.src}`)).join("\n");
+    const unstagedText = (await diff(root, "lines.txt", false)).hunks.flatMap(h => h.lines.map(l => `${l.kind}${l.src}`)).join("\n");
+    expect(stagedText).toContain("+ONE");
+    expect(stagedText).not.toContain("+FOUR");
+    expect(unstagedText).toContain("+FOUR");
+    expect(unstagedText).not.toContain("+ONE");
+  });
+});
+
+describe("git.ts: operation state", () => {
+  test("status reports conflicted files and an in-progress merge", async () => {
+    const root = await makeRepo();
+    await git(root, "checkout", "-q", "-b", "topic");
+    await writeFile(join(root, "README.md"), "topic\n");
+    await git(root, "commit", "-q", "-am", "topic change");
+    await git(root, "checkout", "-q", "main");
+    await writeFile(join(root, "README.md"), "main\n");
+    await git(root, "commit", "-q", "-am", "main change");
+
+    const merge = await runGit(root, ["merge", "topic"]);
+    expect(merge.exitCode).not.toBe(0);
+
+    const snap = await status(root);
+    expect(snap.operation).toEqual({ type: "merge", current: null, total: null });
+    expect(snap.files).toContainEqual(expect.objectContaining({
+      path: "README.md",
+      code: "U",
+      conflict: "UU",
+    }));
+  });
+
+  test("continues a merge after its resolution is staged", async () => {
+    const root = await makeRepo();
+    await git(root, "checkout", "-q", "-b", "topic");
+    await writeFile(join(root, "README.md"), "topic\n");
+    await git(root, "commit", "-q", "-am", "topic change");
+    await git(root, "checkout", "-q", "main");
+    await writeFile(join(root, "README.md"), "main\n");
+    await git(root, "commit", "-q", "-am", "main change");
+    expect((await runGit(root, ["merge", "topic"])).exitCode).not.toBe(0);
+    await writeFile(join(root, "README.md"), "main and topic\n");
+    await stage(root, ["README.md"]);
+
+    await operationAction(root, "continue");
+
+    expect((await status(root)).operation).toBeNull();
+    expect((await runGit(root, ["log", "-1", "--pretty=%P"])).stdout.trim().split(" ")).toHaveLength(2);
+  });
+
+  test("reads three conflict stages and saves the resolution", async () => {
+    const root = await makeRepo();
+    await git(root, "checkout", "-q", "-b", "topic");
+    await writeFile(join(root, "README.md"), "topic\n");
+    await git(root, "commit", "-q", "-am", "topic change");
+    await git(root, "checkout", "-q", "main");
+    await writeFile(join(root, "README.md"), "main\n");
+    await git(root, "commit", "-q", "-am", "main change");
+    expect((await runGit(root, ["merge", "topic"])).exitCode).not.toBe(0);
+
+    const conflict = await conflictFile(root, "README.md");
+    expect(conflict.base).toBe("hi\n");
+    expect(conflict.ours).toBe("main\n");
+    expect(conflict.theirs).toBe("topic\n");
+    expect(conflict.result).toContain("<<<<<<< HEAD");
+
+    await saveConflictResolution(root, "README.md", "resolved\n");
+    const snap = await status(root);
+    expect(snap.files.find(f => f.code === "U")).toBeUndefined();
+    expect(snap.staged).toContainEqual(expect.objectContaining({ path: "README.md" }));
   });
 });
 
@@ -133,12 +248,43 @@ describe("git.ts: mutations", () => {
     expect(r.sha).toMatch(/^[0-9a-f]{7}/);
     expect((await status(root)).files).toEqual([]);
   });
+  test("commit can add a Signed-off-by trailer", async () => {
+    const root = await makeRepo();
+    await writeFile(join(root, "x.txt"), "x\n");
+    await stage(root, ["x.txt"]);
+    await commit(root, "add x", false, true);
+    const message = (await runGit(root, ["log", "-1", "--pretty=%B"])).stdout;
+    expect(message).toContain("Signed-off-by: t <t@t>");
+  });
+  test("commit context returns identity, HEAD message, template, and signing preference", async () => {
+    const root = await makeRepo();
+    await writeFile(join(root, ".commit-template"), "Template summary\n\nTemplate body\n");
+    await git(root, "config", "commit.template", ".commit-template");
+    await git(root, "config", "commit.gpgSign", "true");
+    const context = await commitContext(root);
+    expect(context).toEqual({
+      authorName: "t",
+      authorEmail: "t@t",
+      headMessage: "init",
+      template: "Template summary\n\nTemplate body\n",
+      signingEnabled: true,
+    });
+  });
   test("discard reverts a working-tree change", async () => {
     const root = await makeRepo();
     await writeFile(join(root, "README.md"), "hi\nbad\n");
     await discard(root, ["README.md"]);
     const snap = await status(root);
     expect(snap.files).toEqual([]);
+  });
+  test("ignore adds exact root-relative patterns without duplicates", async () => {
+    const root = await makeRepo();
+    await writeFile(join(root, "debug[1].log"), "noise\n");
+    await ignore(root, ["debug[1].log"]);
+    await ignore(root, ["debug[1].log"]);
+    const contents = await Bun.file(join(root, ".gitignore")).text();
+    expect(contents).toBe("/debug\\[1\\].log\n");
+    expect((await status(root)).files.map(f => f.path)).toEqual([".gitignore"]);
   });
 });
 
@@ -171,6 +317,65 @@ describe("git.ts: branches", () => {
     const bs = await branches(root);
     expect(bs.find(b => b.current)!.name).toBe("feat/z");
   });
+
+  test("merges another branch into the current branch", async () => {
+    const root = await makeRepo();
+    await git(root, "checkout", "-q", "-b", "topic");
+    await writeFile(join(root, "topic.txt"), "topic\n");
+    await git(root, "add", ".");
+    await git(root, "commit", "-q", "-m", "topic");
+    await git(root, "checkout", "-q", "main");
+    await merge(root, "topic");
+    expect((await runGit(root, ["log", "-1", "--pretty=%s"])).stdout.trim()).toBe("topic");
+  });
+
+  test("rebases current commits onto another branch", async () => {
+    const root = await makeRepo();
+    await git(root, "checkout", "-q", "-b", "base");
+    await writeFile(join(root, "base.txt"), "base\n");
+    await git(root, "add", ".");
+    await git(root, "commit", "-q", "-m", "base");
+    await git(root, "checkout", "-q", "main");
+    await writeFile(join(root, "main.txt"), "main\n");
+    await git(root, "add", ".");
+    await git(root, "commit", "-q", "-m", "main work");
+    await rebase(root, "base");
+    expect((await runGit(root, ["merge-base", "--is-ancestor", "base", "main"])).exitCode).toBe(0);
+  });
+
+  test("cherry-picks and reverts a commit", async () => {
+    const root = await makeRepo();
+    await git(root, "checkout", "-q", "-b", "topic");
+    await writeFile(join(root, "picked.txt"), "picked\n");
+    await git(root, "add", ".");
+    await git(root, "commit", "-q", "-m", "pick me");
+    const sha = (await runGit(root, ["rev-parse", "HEAD"])).stdout.trim();
+    await git(root, "checkout", "-q", "main");
+    await cherryPick(root, [sha]);
+    expect((await status(root)).files).toEqual([]);
+    const picked = (await runGit(root, ["rev-parse", "HEAD"])).stdout.trim();
+    await revert(root, picked);
+    expect((await runGit(root, ["log", "-1", "--pretty=%s"])).stdout.trim()).toBe('Revert "pick me"');
+  });
+
+  test("compares divergent refs with counts, commits, and files", async () => {
+    const root = await makeRepo();
+    await git(root, "checkout", "-q", "-b", "topic");
+    await writeFile(join(root, "topic.txt"), "topic\n");
+    await git(root, "add", ".");
+    await git(root, "commit", "-q", "-m", "topic work");
+    await git(root, "checkout", "-q", "main");
+    await writeFile(join(root, "main.txt"), "main\n");
+    await git(root, "add", ".");
+    await git(root, "commit", "-q", "-m", "main work");
+
+    const comparison = await compareRefs(root, "topic", "main");
+
+    expect(comparison.ahead).toBe(1);
+    expect(comparison.behind).toBe(1);
+    expect(comparison.commits.map(entry => entry.subject)).toEqual(["main work"]);
+    expect(comparison.files.map(file => file.path)).toEqual(["main.txt"]);
+  });
 });
 
 describe("git.ts: stashes/tags/log", () => {
@@ -196,6 +401,15 @@ describe("git.ts: stashes/tags/log", () => {
     expect(await stashes(root)).toEqual([]);
   });
 
+  test("stash can include untracked files and exposes a diff", async () => {
+    const root = await makeRepo();
+    await writeFile(join(root, "README.md"), "changed\n");
+    await writeFile(join(root, "untracked.txt"), "new\n");
+    await stashCreate(root, "with untracked", { includeUntracked: true });
+    expect((await status(root)).files).toEqual([]);
+    expect((await stashDiff(root, 0)).map(file => file.path).sort()).toEqual(["README.md", "untracked.txt"]);
+  });
+
   test("tags is empty in a fresh repo", async () => {
     const root = await makeRepo();
     expect(await tags(root)).toEqual([]);
@@ -213,6 +427,124 @@ describe("git.ts: stashes/tags/log", () => {
     const an = await runGit(root, ["for-each-ref", "--format=%(objecttype)", "refs/tags/v1.1.0"]);
     expect(lw.stdout.trim()).toBe("commit");
     expect(an.stdout.trim()).toBe("tag");
+  });
+});
+
+describe("git.ts: recovery", () => {
+  test("mixed reset preserves files, creates a safety ref, and remains recoverable", async () => {
+    const root = await makeRepo();
+    await writeFile(join(root, "recover.txt"), "recover me\n");
+    await git(root, "add", ".");
+    await git(root, "commit", "-q", "-m", "recoverable work");
+    const originalHead = (await runGit(root, ["rev-parse", "HEAD"])).stdout.trim();
+
+    const safetyRef = await resetTo(root, "HEAD^", "mixed");
+
+    expect(await Bun.file(join(root, "recover.txt")).text()).toBe("recover me\n");
+    expect((await runGit(root, ["rev-parse", safetyRef])).stdout.trim()).toBe(originalHead);
+    const branch = await recoverBranch(root, originalHead);
+    expect((await runGit(root, ["rev-parse", branch])).stdout.trim()).toBe(originalHead);
+    expect((await reflog(root)).some(entry => entry.action.includes("reset"))).toBe(true);
+  });
+
+  test("rejects destructive reset modes at runtime", async () => {
+    const root = await makeRepo();
+    await expect(resetTo(root, "HEAD", "hard" as any)).rejects.toThrow(/Only soft and mixed/);
+  });
+});
+
+describe("git.ts: interactive rebase", () => {
+  test("fixups a commit while preserving every planned commit and a safety ref", async () => {
+    const root = await makeRepo();
+    for (const name of ["one", "two", "three"]) {
+      await writeFile(join(root, `${name}.txt`), `${name}\n`);
+      await git(root, "add", ".");
+      await git(root, "commit", "-q", "-m", name);
+    }
+    const upstream = (await runGit(root, ["rev-parse", "HEAD~3"])).stdout.trim();
+    const oldHead = (await runGit(root, ["rev-parse", "HEAD"])).stdout.trim();
+    const plan = await rebasePlan(root, upstream);
+    plan.steps[1] = { ...plan.steps[1]!, action: "fixup" };
+
+    const safetyRef = await interactiveRebase(root, upstream, plan.steps);
+
+    expect((await runGit(root, ["rev-list", "--count", `${upstream}..HEAD`])).stdout.trim()).toBe("2");
+    expect((await runGit(root, ["log", "--format=%s", `${upstream}..HEAD`])).stdout.trim().split("\n")).toEqual(["three", "one"]);
+    expect((await runGit(root, ["rev-parse", safetyRef])).stdout.trim()).toBe(oldHead);
+  });
+
+  test("rejects a plan that omits a commit", async () => {
+    const root = await makeRepo();
+    await writeFile(join(root, "one.txt"), "one\n");
+    await git(root, "add", ".");
+    await git(root, "commit", "-q", "-m", "one");
+    const plan = await rebasePlan(root, "HEAD^");
+    await expect(interactiveRebase(root, "HEAD^", [])).rejects.toThrow(/every commit exactly once/);
+    expect(plan.steps).toHaveLength(1);
+  });
+});
+
+describe("git.ts: bisect", () => {
+  test("starts and resets a bisect session reflected in operation state", async () => {
+    const root = await makeRepo();
+    for (const name of ["middle", "bad"]) {
+      await writeFile(join(root, `${name}.txt`), `${name}\n`);
+      await git(root, "add", ".");
+      await git(root, "commit", "-q", "-m", name);
+    }
+    await bisect(root, "start", "HEAD~2", "HEAD");
+    expect((await status(root)).operation?.type).toBe("bisect");
+    await bisect(root, "reset");
+    expect((await status(root)).operation).toBeNull();
+    expect((await runGit(root, ["branch", "--show-current"])).stdout.trim()).toBe("main");
+  });
+});
+
+describe("git.ts: file insight", () => {
+  test("returns line blame metadata and file history", async () => {
+    const root = await makeRepo();
+    await writeFile(join(root, "README.md"), "hi\nsecond\n");
+    await git(root, "commit", "-q", "-am", "add second line");
+    const insight = await fileInsight(root, "README.md");
+    expect(insight.path).toBe("README.md");
+    expect(insight.blame).toHaveLength(2);
+    expect(insight.blame[1]).toEqual(expect.objectContaining({ line: 2, author: "t", summary: "add second line", content: "second" }));
+    expect(insight.history.map(entry => entry.subject)).toEqual(["add second line", "init"]);
+  });
+});
+
+describe("git.ts: worktrees", () => {
+  test("adds, lists, locks, unlocks, and removes a clean worktree", async () => {
+    const root = await makeRepo();
+    const parent = await mkdtemp(join(tmpdir(), "tabterm-worktree-parent-"));
+    const path = join(parent, "topic");
+    await worktreeAdd(root, path, "HEAD", "topic");
+    const resolvedPath = await realpath(path);
+    expect(await worktrees(root)).toContainEqual(expect.objectContaining({ path: resolvedPath, branch: "topic", locked: null }));
+    await worktreeLock(root, resolvedPath, true, "test lock");
+    expect((await worktrees(root)).find(item => item.path === resolvedPath)?.locked).toBe("test lock");
+    await worktreeLock(root, resolvedPath, false);
+    await worktreeRemove(root, resolvedPath);
+    expect((await worktrees(root)).map(item => item.path)).toEqual([await realpath(root)]);
+  });
+});
+
+describe("git.ts: subtrees", () => {
+  test("adds a missing subtree then pulls later remote changes", async () => {
+    const remote = await makeRepo();
+    await writeFile(join(remote, "library.txt"), "v1\n");
+    await git(remote, "add", ".");
+    await git(remote, "commit", "-q", "-m", "library v1");
+    const root = await makeRepo();
+    const mapping = { prefix: "vendor/library", remoteUrl: remote, branch: "main", squash: true };
+
+    await subtreeSync(root, mapping, "pull");
+    expect(await Bun.file(join(root, "vendor/library/library.txt")).text()).toBe("v1\n");
+
+    await writeFile(join(remote, "library.txt"), "v2\n");
+    await git(remote, "commit", "-q", "-am", "library v2");
+    await subtreeSync(root, mapping, "pull");
+    expect(await Bun.file(join(root, "vendor/library/library.txt")).text()).toBe("v2\n");
   });
 });
 
@@ -316,5 +648,116 @@ describe("git.ts: push", () => {
     await git(work, "commit", "-q", "-am", "local");
 
     await expect(push(work, "main", "origin", false)).rejects.toThrow(/Pull first/);
+  });
+});
+
+describe("git.ts: fetch/pull", () => {
+  async function setup(): Promise<{ work: string; other: string }> {
+    const bare = await mkdtemp(join(tmpdir(), "tabterm-sync-bare-"));
+    await git(bare, "init", "-q", "--bare", "-b", "main");
+    const work = await mkdtemp(join(tmpdir(), "tabterm-sync-work-"));
+    await git(work, "clone", "-q", bare, ".");
+    await git(work, "config", "user.email", "t@t");
+    await git(work, "config", "user.name", "t");
+    await writeFile(join(work, "README.md"), "one\n");
+    await git(work, "add", ".");
+    await git(work, "commit", "-q", "-m", "init");
+    await git(work, "push", "-q", "-u", "origin", "main");
+    const other = await mkdtemp(join(tmpdir(), "tabterm-sync-other-"));
+    await git(other, "clone", "-q", bare, ".");
+    await git(other, "config", "user.email", "t@t");
+    await git(other, "config", "user.name", "t");
+    return { work, other };
+  }
+
+  test("fetch updates remote branches and behind count without changing HEAD", async () => {
+    const { work, other } = await setup();
+    await writeFile(join(other, "remote.txt"), "remote\n");
+    await git(other, "add", ".");
+    await git(other, "commit", "-q", "-m", "remote work");
+    await git(other, "push", "-q", "origin", "main");
+    const before = (await status(work)).headSha;
+
+    await fetchRemote(work, "origin", true);
+
+    expect((await status(work)).headSha).toBe(before);
+    expect((await status(work)).behind).toBe(1);
+    expect(await remoteBranches(work)).toContainEqual(expect.objectContaining({
+      name: "origin/main",
+      remote: "origin",
+      branch: "main",
+    }));
+  });
+
+  test("fast-forward pull updates the working tree", async () => {
+    const { work, other } = await setup();
+    await writeFile(join(other, "remote.txt"), "remote\n");
+    await git(other, "add", ".");
+    await git(other, "commit", "-q", "-m", "remote work");
+    await git(other, "push", "-q", "origin", "main");
+
+    await pull(work, "ff-only");
+
+    expect((await status(work)).behind).toBe(0);
+    expect((await runGit(work, ["log", "-1", "--pretty=%s"])).stdout.trim()).toBe("remote work");
+  });
+});
+
+describe("git.ts: professional workflow", () => {
+  test("completes sync, partial staging, rewrite, conflict resolution, publish, and recovery", async () => {
+    const bare = await mkdtemp(join(tmpdir(), "tabterm-flow-bare-"));
+    await git(bare, "init", "-q", "--bare", "-b", "main");
+    const maintainer = await mkdtemp(join(tmpdir(), "tabterm-flow-maintainer-"));
+    await git(maintainer, "clone", "-q", bare, ".");
+    await git(maintainer, "config", "user.email", "maintainer@test");
+    await git(maintainer, "config", "user.name", "maintainer");
+    await writeFile(join(maintainer, "README.md"), "alpha\nbeta\ngamma\n");
+    await git(maintainer, "add", ".");
+    await git(maintainer, "commit", "-q", "-m", "initial content");
+    await git(maintainer, "push", "-q", "-u", "origin", "main");
+
+    const work = await mkdtemp(join(tmpdir(), "tabterm-flow-work-"));
+    await git(work, "clone", "-q", bare, ".");
+    await git(work, "config", "user.email", "author@test");
+    await git(work, "config", "user.name", "author");
+
+    await fetchRemote(work, "origin", true);
+    await branchCreate(work, "feature/professional-flow", null, true);
+    await writeFile(join(work, "README.md"), "ALPHA\nBETA\ngamma\n");
+    const change = await diff(work, "README.md", false);
+    const alphaDeletion = change.hunks[0]!.lines.findIndex(line => line.kind === "-" && line.src === "alpha");
+    const alphaAddition = change.hunks[0]!.lines.findIndex(line => line.kind === "+" && line.src === "ALPHA");
+    const patch = serializeSelectedLines(change.hunks[0]!, "README.md", new Set([alphaDeletion, alphaAddition]));
+    expect(patch).not.toBeNull();
+    await stageHunk(work, patch!, false, "README.md");
+    await commit(work, "change only alpha", false);
+    expect((await diff(work, "README.md", false)).hunks.flatMap(hunk => hunk.lines).some(line => line.src === "BETA")).toBe(true);
+    await discard(work, ["README.md"]);
+
+    await writeFile(join(maintainer, "remote.txt"), "upstream work\n");
+    await git(maintainer, "add", ".");
+    await git(maintainer, "commit", "-q", "-m", "advance main");
+    await git(maintainer, "push", "-q", "origin", "main");
+    await fetchRemote(work, "origin", true);
+    await rebase(work, "origin/main");
+
+    await branchCreate(work, "integration", "origin/main", true);
+    await writeFile(join(work, "README.md"), "INTEGRATION\nbeta\ngamma\n");
+    await stage(work, ["README.md"]);
+    await commit(work, "integration change", false);
+    await checkout(work, "feature/professional-flow");
+    await expect(merge(work, "integration")).rejects.toThrow();
+    expect((await status(work)).operation?.type).toBe("merge");
+    expect((await conflictFile(work, "README.md")).theirs).toContain("INTEGRATION");
+    await saveConflictResolution(work, "README.md", "ALPHA + INTEGRATION\nbeta\ngamma\n");
+    await operationAction(work, "continue");
+
+    await push(work, "feature/professional-flow", "origin", true);
+    expect((await branches(work)).find(branch => branch.current)?.upstream).toBe("origin/feature/professional-flow");
+    const publishedHead = (await runGit(work, ["rev-parse", "HEAD"])).stdout.trim();
+    const safetyRef = await resetTo(work, "HEAD^", "mixed");
+    expect((await runGit(work, ["rev-parse", safetyRef])).stdout.trim()).toBe(publishedHead);
+    const recovered = await recoverBranch(work, publishedHead);
+    expect((await runGit(work, ["rev-parse", recovered])).stdout.trim()).toBe(publishedHead);
   });
 });

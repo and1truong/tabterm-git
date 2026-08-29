@@ -1,5 +1,5 @@
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "bun";
@@ -53,8 +53,8 @@ function captureSends(): { peer: Peer; sent: any[] } {
   return { peer: { send: (m: unknown) => sent.push(m) }, sent };
 }
 
-function ctxFor(key: string): RoomContext {
-  return { key, push: () => {} };
+function ctxFor(key: string, pushed: any[] = []): RoomContext {
+  return { key, push: (message) => pushed.push(message) };
 }
 
 describe("git module onJoin: loading vs not-a-repo", () => {
@@ -94,3 +94,60 @@ describe("git module onJoin: loading vs not-a-repo", () => {
     expect(sent.filter((m) => m.type === "git:status")).toEqual([]);
   });
 });
+
+describe("git module initialization", () => {
+  test("git:init initializes the workspace cwd and broadcasts its first snapshot", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "tabterm-init-srv-"));
+    const { host, spec } = fakeHost({ tab1: dir });
+    activate(host);
+    const { peer, sent } = captureSends();
+    const pushed: any[] = [];
+
+    await spec().onRequest!(ctxFor("tab1", pushed), { type: "git:init", tabId: "tab1" }, peer);
+
+    expect(sent).toEqual([]);
+    expect(pushed[0]).toEqual(expect.objectContaining({
+      type: "git:status",
+      tabId: "tab1",
+      snapshot: expect.objectContaining({ branch: "main", headSha: null }),
+    }));
+    expect(pushed[1]).toEqual(expect.objectContaining({ type: "git:refs", tabId: "tab1" }));
+    expect((await run(dir, ["rev-parse", "--show-toplevel"])).trim()).toBe(await realpath(dir));
+    await rm(dir, { recursive: true, force: true });
+  });
+});
+
+describe("git module jobs", () => {
+  test("a checkout broadcasts running and successful completion states", async () => {
+    const repo = await makeRepo();
+    await git(repo, "branch", "topic");
+    const { host, spec } = fakeHost({ tab1: repo });
+    activate(host);
+    const { peer, sent } = captureSends();
+    const pushed: any[] = [];
+
+    await spec().onRequest!(ctxFor("tab1", pushed), { type: "git:checkout", tabId: "tab1", branch: "topic" }, peer);
+
+    expect(sent).toEqual([]);
+    expect(pushed[0]).toEqual(expect.objectContaining({
+      type: "git:job",
+      tabId: "tab1",
+      job: expect.objectContaining({ kind: "checkout", label: "Checking out topic" }),
+    }));
+    expect(pushed).toContainEqual(expect.objectContaining({
+      type: "git:jobDone",
+      ok: true,
+      job: expect.objectContaining({ kind: "checkout" }),
+    }));
+    expect(pushed.at(-1)).toEqual({ type: "git:job", tabId: "tab1", job: null });
+    expect((await run(repo, ["branch", "--show-current"])).trim()).toBe("topic");
+    await rm(repo, { recursive: true, force: true });
+  });
+});
+
+async function run(cwd: string, args: string[]): Promise<string> {
+  const p = spawn(["git", "-C", cwd, ...args], { stdout: "pipe", stderr: "ignore" });
+  const stdout = await new Response(p.stdout).text();
+  await p.exited;
+  return stdout;
+}

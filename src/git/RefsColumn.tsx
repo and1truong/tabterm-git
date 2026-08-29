@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import { useHost } from "../useHost.ts";
-import type { GitRefs, Branch, Stash, Submodule } from "../../shared.ts";
+import type { GitRefs, Branch, RemoteBranch, Stash, Submodule } from "../../shared.ts";
 
-type ManageTab = "remotes" | "submodules" | "subtrees";
+type ManageTab = "remotes" | "submodules" | "subtrees" | "worktrees";
 
 interface Props {
   refs: GitRefs | undefined;
@@ -20,6 +20,8 @@ export function RefsColumn({ refs, tabId, onManage, onNewTag, onNewBranch }: Pro
   const branchMenuRef = useRef<HTMLDivElement>(null);
   const [newStash, setNewStash] = useState("");
   const [addingStash, setAddingStash] = useState(false);
+  const [stashUntracked, setStashUntracked] = useState(false);
+  const [stashKeepIndex, setStashKeepIndex] = useState(false);
   const [menu, setMenu] = useState<{ branch: Branch; x: number; y: number } | null>(null);
   const [pushingBranch, setPushingBranch] = useState<string | null>(null);
   const pushErrRef = useRef<string | null>(null);
@@ -50,10 +52,12 @@ export function RefsColumn({ refs, tabId, onManage, onNewTag, onNewBranch }: Pro
   }, [refs, gitError, pushingBranch]);
 
   const branches  = refs?.branches   ?? [];
+  const remoteBranches = refs?.remoteBranches ?? [];
   const remotes   = refs?.remotes    ?? [];
   const stashes   = refs?.stashes    ?? [];
   const tags      = refs?.tags       ?? [];
   const submodules = refs?.submodules ?? [];
+  const worktrees = refs?.worktrees ?? [];
 
   // gitSubtrees is module-owned: seeded on ManageDialog mount via GET /subtrees
   // and kept live by the module's gitSubtree service (host.sync → module:patch).
@@ -81,8 +85,8 @@ export function RefsColumn({ refs, tabId, onManage, onNewTag, onNewBranch }: Pro
   };
   const createStash = () => {
     const message = newStash.trim();
-    if (message) { send({ type: "git:stashCreate", tabId, message }); }
-    setNewStash(""); setAddingStash(false);
+    send({ type: "git:stashCreate", tabId, message, options: { includeUntracked: stashUntracked, keepIndex: stashKeepIndex } });
+    setNewStash(""); setAddingStash(false); setStashUntracked(false); setStashKeepIndex(false);
   };
 
   return (
@@ -135,17 +139,16 @@ export function RefsColumn({ refs, tabId, onManage, onNewTag, onNewBranch }: Pro
           pushing={pushingBranch === b.name}
           menuOpen={menu?.branch.name === b.name}
           onContext={(branch, x, y) => setMenu({ branch, x, y })}
+          onCheckout={() => !b.current && checkout(b.name)}
         />
       ))}
 
-      {/* Remotes */}
-      <SectTitle label="Remotes" count={remotes.length}>
+      {/* Remote branches */}
+      <SectTitle label="Remotes" count={remoteBranches.length}>
         <button className="ml-auto text-[10.5px] text-[var(--accent-soft)] font-bold" onClick={() => onManage("remotes")}>manage</button>
       </SectTitle>
-      {remotes.map(r => (
-        <RefRow key={r.name}>
-          <span className="mono text-[12px] text-[var(--text)] truncate">{r.name}</span>
-        </RefRow>
+      {remoteBranches.map(branch => (
+        <RemoteBranchRow key={branch.name} branch={branch} onCheckout={() => send({ type: "git:checkoutRemote", tabId, branch: branch.name, localName: branch.branch })} />
       ))}
 
       {/* Stashes */}
@@ -166,6 +169,10 @@ export function RefsColumn({ refs, tabId, onManage, onNewTag, onNewBranch }: Pro
             onChange={e => setNewStash(e.target.value)}
             onKeyDown={e => { if (e.key === "Enter") createStash(); if (e.key === "Escape") { setAddingStash(false); setNewStash(""); } }}
           />
+          <div className="flex gap-3 mt-1.5 text-[10.5px] text-[var(--muted)]">
+            <label className="flex items-center gap-1"><input type="checkbox" checked={stashUntracked} onChange={(e) => setStashUntracked(e.target.checked)} /> untracked</label>
+            <label className="flex items-center gap-1"><input type="checkbox" checked={stashKeepIndex} onChange={(e) => setStashKeepIndex(e.target.checked)} /> keep staged</label>
+          </div>
         </div>
       )}
       {stashes.map(s => <StashRow key={s.index} stash={s} tabId={tabId} onSend={send} />)}
@@ -188,6 +195,16 @@ export function RefsColumn({ refs, tabId, onManage, onNewTag, onNewBranch }: Pro
       </SectTitle>
       {submodules.map(s => <SubmoduleRow key={s.path} sub={s} tabId={tabId} onSend={send} />)}
 
+      {/* Worktrees */}
+      <SectTitle label="Worktrees" count={worktrees.length}>
+        <button className="ml-auto text-[10.5px] text-[var(--accent-soft)] font-bold" onClick={() => onManage("worktrees")}>manage</button>
+      </SectTitle>
+      {worktrees.map(worktree => (
+        <RefRow key={worktree.path}>
+          <span className="mono text-[12px] text-[var(--muted)] truncate" title={worktree.path}>{worktree.branch ?? worktree.head?.slice(0, 7) ?? "bare"}</span>
+        </RefRow>
+      ))}
+
       {/* Subtrees */}
       <SectTitle label="Subtrees" count={subtreeCount}>
         <button className="ml-auto text-[10.5px] text-[var(--accent-soft)] font-bold" onClick={() => onManage("subtrees")}>manage</button>
@@ -200,11 +217,28 @@ export function RefsColumn({ refs, tabId, onManage, onNewTag, onNewBranch }: Pro
           onClose={() => setMenu(null)}
           onCheckout={() => { checkout(menu.branch.name); setMenu(null); }}
           onPush={() => pushBranch(menu.branch)}
+          onMerge={() => { send({ type: "git:merge", tabId, ref: menu.branch.name, noFf: false }); setMenu(null); }}
+          onRebase={() => { send({ type: "git:rebase", tabId, ref: menu.branch.name }); setMenu(null); }}
+          onInteractiveRebase={() => { send({ type: "git:openRebasePlan", tabId, upstream: menu.branch.name }); setMenu(null); }}
+          onCompare={() => { send({ type: "git:compare", tabId, base: menu.branch.name, head: "HEAD" }); setMenu(null); }}
+          onFetch={() => { send({ type: "git:fetch", tabId, remote: null, prune: true }); setMenu(null); }}
+          onPull={() => { send({ type: "git:pull", tabId, strategy: "ff-only" }); setMenu(null); }}
           onCopy={() => { navigator.clipboard?.writeText(menu.branch.name); setMenu(null); }}
           onDelete={() => { deleteBranch(menu.branch.name, false); setMenu(null); }}
         />
       )}
     </div>
+  );
+}
+
+function RemoteBranchRow({ branch, onCheckout }: { branch: RemoteBranch; onCheckout: () => void }) {
+  return (
+    <RefRow onClick={onCheckout}>
+      <span className="w-2 h-2 rounded-full shrink-0 border border-[var(--faint)]" />
+      <span className="mono text-[12px] text-[var(--muted)] truncate" title={`Checkout ${branch.name}`}>
+        <span className="text-[var(--faint)]">{branch.remote}/</span>{branch.branch}
+      </span>
+    </RefRow>
   );
 }
 
@@ -229,11 +263,12 @@ function RefRow({ children, onClick, active }: { children: React.ReactNode; onCl
   );
 }
 
-function BranchRow({ branch, pushing, onContext, menuOpen }: {
+function BranchRow({ branch, pushing, onContext, menuOpen, onCheckout }: {
   branch: Branch;
   pushing: boolean;
   menuOpen: boolean;
   onContext: (branch: Branch, x: number, y: number) => void;
+  onCheckout: () => void;
 }) {
   const isCurrent = branch.current;
   const ahead  = branch.ahead;
@@ -243,6 +278,8 @@ function BranchRow({ branch, pushing, onContext, menuOpen }: {
   return (
     <div
       onContextMenu={(e) => { e.preventDefault(); onContext(branch, e.clientX, e.clientY); }}
+      onDoubleClick={onCheckout}
+      title={branch.current ? "Current branch" : `Double-click to checkout ${branch.name}`}
       className={`group flex items-center gap-1.5 px-3 py-1.5 text-[12.5px] cursor-default ${
         menuOpen ? "bg-[var(--hover)] outline outline-1 -outline-offset-1 outline-[var(--border-2)]"
         : isCurrent ? "bg-[var(--active)]" : "hover:bg-[var(--hover)]"
@@ -260,21 +297,38 @@ function BranchRow({ branch, pushing, onContext, menuOpen }: {
       ) : (
         <span className="mono text-[11px] text-[var(--faint)] shrink-0">{tracking}</span>
       )}
+      <button
+        aria-label={`Open actions for ${branch.name}`}
+        title={`Actions for ${branch.name}`}
+        className={`w-5 shrink-0 rounded text-[14px] leading-none text-[var(--muted)] hover:bg-[var(--active)] hover:text-[var(--text)] ${menuOpen ? "opacity-100" : "opacity-0 group-hover:opacity-100 focus:opacity-100"}`}
+        onClick={(event) => {
+          event.stopPropagation();
+          const rect = event.currentTarget.getBoundingClientRect();
+          onContext(branch, rect.left, rect.bottom + 4);
+        }}
+      >⋯</button>
     </div>
   );
 }
 
-function BranchContextMenu({ branch, x, y, onClose, onCheckout, onPush, onCopy, onDelete }: {
+function BranchContextMenu({ branch, x, y, onClose, onCheckout, onPush, onMerge, onRebase, onInteractiveRebase, onCompare, onFetch, onPull, onCopy, onDelete }: {
   branch: Branch;
   x: number;
   y: number;
   onClose: () => void;
   onCheckout: () => void;
   onPush: () => void;
+  onMerge: () => void;
+  onRebase: () => void;
+  onInteractiveRebase: () => void;
+  onCompare: () => void;
+  onFetch: () => void;
+  onPull: () => void;
   onCopy: () => void;
   onDelete: () => void;
 }) {
   const ref = useRef<HTMLDivElement>(null);
+  const [confirming, setConfirming] = useState<"merge" | "rebase" | null>(null);
   useEffect(() => {
     const onPointer = (e: PointerEvent) => {
       if (ref.current && !ref.current.contains(e.target as Node)) onClose();
@@ -299,7 +353,21 @@ function BranchContextMenu({ branch, x, y, onClose, onCheckout, onPush, onCopy, 
       style={{ left: x, top: y }}
     >
       {!branch.current && (
-        <MenuItem label="Checkout" onClick={onCheckout} />
+        <>
+          <MenuItem label="Checkout" onClick={onCheckout} />
+          <MenuItem label="Merge into current" onClick={() => setConfirming("merge")} />
+          <MenuItem label="Rebase current onto this" onClick={() => setConfirming("rebase")} />
+          <MenuItem label="Interactive rebase…" onClick={onInteractiveRebase} />
+        </>
+      )}
+      {confirming && (
+        <div className="m-1 p-2 rounded bg-[var(--bg)] text-[11px] text-[var(--muted)]">
+          <div>{confirming === "merge" ? `Merge ${branch.name} into the current branch?` : `Rewrite current commits onto ${branch.name}?`}</div>
+          <div className="flex gap-2 mt-2">
+            <button className="font-bold" onClick={() => setConfirming(null)}>Cancel</button>
+            <button className="font-bold text-[var(--accent-soft)]" onClick={confirming === "merge" ? onMerge : onRebase}>Confirm</button>
+          </div>
+        </div>
       )}
       <MenuItem
         label={publish ? "Publish to origin" : "Push to origin"}
@@ -307,10 +375,11 @@ function BranchContextMenu({ branch, x, y, onClose, onCheckout, onPush, onCopy, 
         tone={publish ? "publish" : "push"}
         onClick={onPush}
       />
+      {!branch.current && <MenuItem label="Compare with current" onClick={onCompare} />}
       <MenuItem label="Copy name" onClick={onCopy} />
       <div className="h-px bg-[var(--border)] mx-1.5 my-1" />
-      <MenuItem label="Fetch" hint="soon" disabled />
-      <MenuItem label="Pull" hint="soon" disabled />
+      <MenuItem label="Fetch all remotes" onClick={onFetch} />
+      <MenuItem label="Pull (fast-forward only)" disabled={!branch.current || !branch.upstream} onClick={onPull} />
       {!branch.current && (
         <>
           <div className="h-px bg-[var(--border)] mx-1.5 my-1" />
@@ -414,6 +483,10 @@ function StashRow({ stash, tabId, onSend }: { stash: Stash; tabId: string; onSen
           </>
         ) : (
           <>
+            <button
+              className="text-[10.5px] font-bold text-[var(--accent-soft)] hover:text-[var(--text)]"
+              onClick={() => onSend({ type: "git:openStash", tabId, index: stash.index })}
+            >View</button>
             <button
               className="text-[10.5px] font-bold text-[var(--accent-soft)] hover:text-[var(--text)]"
               onClick={() => onSend({ type: "git:stashApply", tabId, index: stash.index, pop: false })}

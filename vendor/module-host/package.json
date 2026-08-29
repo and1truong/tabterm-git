@@ -1,7 +1,7 @@
 {
   "name": "@tabterm/module-host",
-  "version": "0.8.0",
-  "description": "Type-only host contract for tabterm modules. Vendored snapshot from tabterm packages/module-host.",
+  "version": "0.14.0",
+  "description": "Type-only host contract for tabterm modules.",
   "type": "module",
   "private": true,
   "exports": {

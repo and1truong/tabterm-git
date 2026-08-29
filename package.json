@@ -3,13 +3,14 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "tabterm git module — a local Git UI: per-hunk stage/discard, diff viewer, commit composer, history graph, and refs (branches/stashes/tags/submodules/subtrees). Extracted from the tabterm monorepo.",
+  "description": "TabTerm's professional local Git client: line staging, sync, conflict resolution, history, branch workflows, and safe recovery.",
   "engines": {
     "bun": ">=1.3.5"
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "bun test"
+    "test": "bun test",
+    "test:ui": "bun scripts/git-ui-smoke.ts"
   },
   "dependencies": {
     "highlight.js": "^11.11.1",
@@ -23,6 +24,7 @@
     "@tabterm/module-host": "file:./vendor/module-host",
     "@types/bun": "^1.3.14",
     "@types/react": "^18.3.31",
+    "happy-dom": "^20.11.2",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "typescript": "^5.9.3"
