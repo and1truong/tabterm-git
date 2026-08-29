@@ -44,7 +44,10 @@ async function rootCacheValid(entry: { cwd: string; root: string | null }): Prom
   let start: string;
   try { start = await pathRealpath(entry.cwd); } catch { return false; }
   let p = start;
-  const stop = entry.root;
+  // resolveRoot returns the caller's original cwd form when the cwd itself is
+  // the toplevel (server/git.ts) — a symlinked cwd stays in symlink form. Its
+  // realpath IS the repository root, so compare both in the same space.
+  const stop = entry.root !== null && entry.root === entry.cwd ? start : entry.root;
   for (;;) {
     if (await dirExists(joinPath(p, ".git"))) return stop !== null && p === stop;
     if (stop !== null && p === stop) return false;   // root reached without its marker
@@ -95,23 +98,26 @@ export default function activate(host: ServerHost) {
       const [all, remotes, stashes, worktrees] = await Promise.all([
         git.refsOf(root), git.remotes(root), git.stashes(root), git.worktrees(root),
       ]);
-      // A repository boundary may have changed (e.g. a terminal `git init`)
-      // while the subprocesses above were running. Discard the result — the
-      // next refs tick recomputes against the new root; broadcasting stale
-      // refs/submodules would flash the previous repository at the client.
-      if ((await rootFor(key)) !== root) return null;
-      const current = all.branches.find((b) => b.current)?.name ?? null;
-      const refs: GitRefs = { branches: all.branches, remoteBranches: all.remoteBranches, current, remotes, stashes, tags: all.tags, submodules: [], worktrees };
-      if (includeSubmodules || (refsTick.get(key) ?? 0) % SUBMODULES_EVERY === 0) {
-        refs.submodules = await git.submodules(root);
-        cachedSubmodules.set(key, { root, submodules: refs.submodules });
+      const due = includeSubmodules || (refsTick.get(key) ?? 0) % SUBMODULES_EVERY === 0;
+      let submodules: Submodule[];
+      if (due) {
+        submodules = await git.submodules(root);
       } else {
         // Throttled ticks reuse the last successful list — but only for the
         // same root, so a repository-boundary change (e.g. a nested `git init`)
         // never broadcasts the previous repository's submodules.
         const cached = cachedSubmodules.get(key);
-        refs.submodules = cached && cached.root === root ? cached.submodules : [];
+        submodules = cached && cached.root === root ? cached.submodules : [];
       }
+      // Revalidate AFTER every awaited subprocess — a repository boundary may
+      // have changed (e.g. a terminal `git init`) while any of them was
+      // running, including the slow `git submodule status`. Discard the result
+      // instead of caching/broadcasting the superseded root's refs; the next
+      // refs tick recomputes against the new root.
+      if ((await rootFor(key)) !== root) return null;
+      const current = all.branches.find((b) => b.current)?.name ?? null;
+      const refs: GitRefs = { branches: all.branches, remoteBranches: all.remoteBranches, current, remotes, stashes, tags: all.tags, submodules, worktrees };
+      if (due) cachedSubmodules.set(key, { root, submodules });
       return { type: "git:refs", tabId: key, refs };
     } catch (e) {
       return { type: "git:error", tabId: key, message: `Unable to refresh refs: ${(e as Error).message}` };
