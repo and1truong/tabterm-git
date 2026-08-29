@@ -6,7 +6,7 @@ registry or sibling-checkout dependency.
 ## module-host
 
 `@tabterm/module-host` — the type-only host contract every tabterm module compiles
-against. Copied from tabterm's `packages/module-host/` and pinned here as `0.8.0`.
+against. Copied from tabterm's `packages/module-host/` and pinned here as `0.14.0`.
 Resolved via `file:./vendor/module-host` in the root `package.json`.
 
 To update: re-copy `packages/module-host/{src,package.json}` from tabterm into

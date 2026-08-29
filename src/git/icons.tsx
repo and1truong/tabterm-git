@@ -7,6 +7,7 @@ const STYLES: Record<FileCode, string> = {
   R: "text-[var(--accent)] bg-[color-mix(in_srgb,var(--accent)_18%,transparent)]",
   "?": "text-[var(--faint)] bg-[color-mix(in_srgb,var(--faint)_16%,transparent)]",
   S: "text-[var(--accent-soft)] border border-[color-mix(in_srgb,var(--accent)_50%,transparent)]",
+  U: "text-[var(--red)] bg-[color-mix(in_srgb,var(--red)_18%,transparent)]",
 };
 
 export function CodeChip({ code }: { code: FileCode }) {

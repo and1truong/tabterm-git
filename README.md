@@ -3,11 +3,14 @@
 The **git** module for [tabterm](https://github.com/and1truong/tabterm) — a local Git UI
 (`id: git`), extracted from the monorepo (`modules/git/`) into its own repository.
 
-- **Changes** — working-tree status polled per focused workspace; stage/unstage/discard
-  files, a per-hunk diff viewer (staged and unstaged), and a commit composer with amend.
-- **History** — commit log graph + per-commit file diffs.
-- **Refs** — branches, remotes, stashes, tags, submodules, and subtrees in one sidebar,
-  with create/checkout/push/delete actions and a manage dialog.
+- **Changes** — multi-file, hunk, and line staging; exact-path ignore; safe discard;
+  three-way conflict resolution; and commit drafts with body, amend, sign-off, and signing.
+- **Sync** — fetch/prune, selectable pull strategy, publish/push, progress, cancellation,
+  remote branches, and clear non-fast-forward guidance.
+- **History & refs** — searchable DAG, commit metadata/signature, compare, cherry-pick,
+  revert, merge, rebase and interactive squash/fixup, tags, stashes, and blame/file history.
+- **Recovery & power tools** — reflog recovery branches, safety refs and non-destructive
+  resets, bisect, worktrees, submodules, and subtree pull/push.
 
 The server half opens a `host.room("git", …)` that polls `git status` (~1.5s) and refreshes
 refs (~5s) for each subscribed workspace, and routes `git:*` request messages to the git
@@ -23,9 +26,10 @@ server.ts            Server entry — activate(host): the git room (poll + reque
 server/git.ts        git CLI layer — runGit, resolveRoot, status, diff, staging, log, …
 server/subtree*.ts   git_subtrees table: db, migration, gitSubtree:* service
 src/index.tsx        Client entry — activate(host): the Git rail page + git:* event wiring
-src/git/             UI: ChangesPane, CommitComposer, DiffView, HistoryView, RefsColumn,
-                     Branch/Tag create dialogs, ManageDialog
+src/git/             UI: changes/diff/conflicts, commit, history/compare, refs,
+                     recovery, rebase plan, stash, file insight, and management dialogs
 scripts/build-modules.ts   Builds the two self-contained dist artifacts
+scripts/git-ui-smoke.ts    happy-dom interaction smoke test for critical UI flows
 ```
 
 The module talks to the host **only** through `@tabterm/module-host` (the type-only
@@ -39,7 +43,8 @@ tabterm for the full host API.
 ```sh
 bun install        # resolves highlight.js/lucide-react + links @tabterm/module-host
 bun run typecheck  # tsc --noEmit
-bun test           # git-parsing + subtree-service tests
+bun test           # integration + git-parsing + subtree-service tests
+bun run test:ui    # critical UI interaction smoke test
 make build         # -> dist/modules/git/{client.js,server.js}
 ```
 

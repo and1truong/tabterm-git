@@ -1,10 +1,8 @@
 import { useState, useEffect } from "react";
 import { useHost } from "../useHost.ts";
-import type { Remote, Submodule, GitSubtree } from "../../shared.ts";
+import type { Remote, Submodule, GitSubtree, Worktree } from "../../shared.ts";
 
-const NETWORK_DISABLED_TITLE = "Network operations are not available in this version.";
-
-type Tab = "remotes" | "submodules" | "subtrees";
+type Tab = "remotes" | "submodules" | "subtrees" | "worktrees";
 
 interface Props {
   tabId: string;
@@ -33,6 +31,7 @@ export function ManageDialog({ tabId, initialTab, onClose }: Props) {
 
   const remotes: Remote[] = refs?.remotes ?? [];
   const submodules: Submodule[] = refs?.submodules ?? [];
+  const worktrees: Worktree[] = refs?.worktrees ?? [];
   const subtrees = Object.values(gitSubtrees).filter((t) => t.primaryTabId === tabId);
 
   const send = (msg: Record<string, unknown>) => host.send(msg);
@@ -50,7 +49,7 @@ export function ManageDialog({ tabId, initialTab, onClose }: Props) {
         {/* Header */}
         <header className="flex items-baseline gap-2 px-5 py-4 border-b border-[var(--border)]">
           <h3 className="text-[14px] font-bold text-[var(--text)]">Manage</h3>
-          <span className="text-[12px] text-[var(--muted)]">remotes, submodules &amp; subtrees for this repo</span>
+          <span className="text-[12px] text-[var(--muted)]">remotes, dependencies &amp; worktrees for this repo</span>
           <button
             className="ml-auto text-[var(--muted)] hover:text-[var(--text)] font-bold text-[14px] leading-none"
             onClick={onClose}
@@ -60,7 +59,7 @@ export function ManageDialog({ tabId, initialTab, onClose }: Props) {
 
         {/* Tab strip */}
         <div className="flex gap-1 px-5 pt-3 border-b border-[var(--border)]">
-          {(["remotes", "submodules", "subtrees"] as Tab[]).map((t) => (
+          {(["remotes", "submodules", "subtrees", "worktrees"] as Tab[]).map((t) => (
             <button
               key={t}
               onClick={() => setActiveTab(t)}
@@ -85,7 +84,66 @@ export function ManageDialog({ tabId, initialTab, onClose }: Props) {
           {activeTab === "subtrees" && (
             <SubtreesPane primaryTabId={tabId} subtrees={subtrees} onSend={send} />
           )}
+          {activeTab === "worktrees" && (
+            <WorktreesPane tabId={tabId} worktrees={worktrees} branches={refs?.branches?.map((branch: any) => branch.name) ?? []} onSend={send} />
+          )}
         </div>
+      </div>
+    </div>
+  );
+}
+
+function WorktreesPane({ tabId, worktrees, branches, onSend }: {
+  tabId: string;
+  worktrees: Worktree[];
+  branches: string[];
+  onSend: (message: Record<string, unknown>) => void;
+}) {
+  const [adding, setAdding] = useState(false);
+  const [path, setPath] = useState("");
+  const [ref, setRef] = useState(branches[0] ?? "HEAD");
+  const [newBranch, setNewBranch] = useState("");
+  const add = () => {
+    if (!path.trim() || !ref.trim()) return;
+    onSend({ type: "git:worktreeAdd", tabId, path: path.trim(), ref: ref.trim(), newBranch: newBranch.trim() || null });
+    setAdding(false); setPath(""); setNewBranch("");
+  };
+  return (
+    <div className="flex flex-col gap-3">
+      <div className="flex items-center">
+        <span className="text-[11.5px] text-[var(--muted)]">One branch can be worked on in a separate directory.</span>
+        <button className="ml-auto text-[11.5px] font-bold text-[var(--muted)]" onClick={() => onSend({ type: "git:worktreePrune", tabId })}>Prune stale</button>
+      </div>
+      {worktrees.map(worktree => <WorktreeRow key={worktree.path} tabId={tabId} worktree={worktree} onSend={onSend} />)}
+      {adding ? (
+        <div className="rounded-lg border border-[var(--border)] bg-[var(--bg)] p-3 flex flex-col gap-2">
+          <Field label="Directory"><input autoFocus value={path} onChange={(e) => setPath(e.target.value)} placeholder="/path/to/worktree" className={inputCls} /></Field>
+          <Field label="Start point"><input value={ref} onChange={(e) => setRef(e.target.value)} placeholder="main, tag, or commit" className={inputCls} /></Field>
+          <Field label="New branch (optional)"><input value={newBranch} onChange={(e) => setNewBranch(e.target.value)} placeholder="feature/name" className={inputCls} /></Field>
+          <div className="flex gap-2"><button className={btnQuiet} onClick={() => setAdding(false)}>Cancel</button><button className={btnPrimary} onClick={add}>Add worktree</button></div>
+        </div>
+      ) : <button className="self-start text-[12px] font-bold text-[var(--accent-soft)]" onClick={() => setAdding(true)}>＋ Add worktree</button>}
+    </div>
+  );
+}
+
+function WorktreeRow({ tabId, worktree, onSend }: { tabId: string; worktree: Worktree; onSend: (message: Record<string, unknown>) => void }) {
+  const [confirming, setConfirming] = useState(false);
+  return (
+    <div className="rounded-lg border border-[var(--border)] bg-[var(--bg)] p-3">
+      <div className="flex items-center gap-2">
+        <span className="mono text-[12px] font-bold text-[var(--text)] truncate" title={worktree.path}>{worktree.path}</span>
+        <span className="ml-auto mono text-[11px] text-[var(--accent-soft)]">{worktree.branch ?? worktree.head?.slice(0, 7) ?? "bare"}</span>
+      </div>
+      <div className="flex items-center gap-3 mt-2 text-[11.5px]">
+        <button className="font-bold text-[var(--muted)]" onClick={() => navigator.clipboard?.writeText(worktree.path)}>Copy path</button>
+        <button className="font-bold text-[var(--accent-soft)]" onClick={() => onSend({ type: "git:worktreeLock", tabId, path: worktree.path, lock: worktree.locked === null, reason: "Locked from TabTerm" })}>{worktree.locked === null ? "Lock" : "Unlock"}</button>
+        {worktree.locked !== null && <span className="text-[var(--faint)]">{worktree.locked || "locked"}</span>}
+        {confirming ? <>
+          <span className="ml-auto text-[var(--muted)]">Remove this clean worktree?</span>
+          <button className="font-bold text-[var(--muted)]" onClick={() => setConfirming(false)}>Cancel</button>
+          <button className="font-bold text-[var(--red)]" onClick={() => { onSend({ type: "git:worktreeRemove", tabId, path: worktree.path }); setConfirming(false); }}>Remove</button>
+        </> : <button className="ml-auto font-bold text-[var(--red)]" onClick={() => setConfirming(true)}>Remove…</button>}
       </div>
     </div>
   );
@@ -145,9 +203,8 @@ function RemoteRow({ tabId, remote, onSend }: { tabId: string; remote: Remote; o
         <span className="font-bold text-[13px] text-[var(--text)]">{remote.name}</span>
         <div className="ml-auto flex gap-2">
           <button
-            disabled
-            title={NETWORK_DISABLED_TITLE}
-            className="text-[11.5px] font-bold text-[var(--muted)] opacity-40 cursor-not-allowed"
+            onClick={() => onSend({ type: "git:fetch", tabId, remote: remote.name, prune: true })}
+            className="text-[11.5px] font-bold text-[var(--accent-soft)] hover:text-[var(--text)]"
           >Fetch</button>
           {!editing && !confirming && (
             <>
@@ -278,9 +335,8 @@ function SubmoduleRow({ tabId, sub, onSend }: { tabId: string; sub: Submodule; o
             onClick={() => onSend({ type: "git:submoduleUpdate", tabId, path: sub.path })}
           >Update</button>
           <button
-            disabled
-            title={NETWORK_DISABLED_TITLE}
-            className="text-[11.5px] font-bold text-[var(--muted)] opacity-40 cursor-not-allowed"
+            onClick={() => onSend({ type: "git:submoduleUpdateRemote", tabId, path: sub.path })}
+            className="text-[11.5px] font-bold text-[var(--accent-soft)] hover:text-[var(--text)]"
           >Pull latest</button>
         </div>
       </div>
@@ -349,14 +405,12 @@ function SubtreeRow({ subtree, onSend }: { subtree: GitSubtree; onSend: (m: Reco
         {lastSync && <span className="text-[11.5px] text-[var(--muted)]">{lastSync}</span>}
         <div className="ml-auto flex gap-2">
           <button
-            disabled
-            title={NETWORK_DISABLED_TITLE}
-            className="text-[11.5px] font-bold text-[var(--muted)] opacity-40 cursor-not-allowed"
+            onClick={() => onSend({ type: "git:subtreeSync", tabId: subtree.primaryTabId, subtreeId: subtree.id, direction: "pull" })}
+            className="text-[11.5px] font-bold text-[var(--accent-soft)] hover:text-[var(--text)]"
           >Pull</button>
           <button
-            disabled
-            title={NETWORK_DISABLED_TITLE}
-            className="text-[11.5px] font-bold text-[var(--muted)] opacity-40 cursor-not-allowed"
+            onClick={() => onSend({ type: "git:subtreeSync", tabId: subtree.primaryTabId, subtreeId: subtree.id, direction: "push" })}
+            className="text-[11.5px] font-bold text-[var(--accent-soft)] hover:text-[var(--text)]"
           >Push</button>
           {!editing && !confirming && (
             <>

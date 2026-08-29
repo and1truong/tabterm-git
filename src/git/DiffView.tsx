@@ -1,6 +1,7 @@
 import { useMemo } from "react";
 import hljs from "highlight.js/lib/common";
 import type { DiffPayload, DiffHunk } from "../../shared.ts";
+import { serializeHunk, serializeSelectedLines } from "./patch.ts";
 
 interface Props {
   diff: DiffPayload;
@@ -10,6 +11,9 @@ interface Props {
 
 export function DiffView({ diff, onStageHunk }: Props) {
   const langHint = useMemo(() => guessLang(diff.path), [diff.path]);
+  // Partial-patch normalization is forward-only. A staged replacement needs a
+  // different reverse patch, so staged diffs intentionally unstage by hunk.
+  const canStageLines = !!onStageHunk && !diff.staged;
 
   if (diff.isBinary) {
     return <div className="px-4 py-3 text-[var(--muted)] text-sm">Binary file. No textual diff.</div>;
@@ -26,14 +30,25 @@ export function DiffView({ diff, onStageHunk }: Props) {
       <div className="min-w-full w-max">
         {diff.hunks.map((h, idx) => (
           <Hunk key={idx} h={h} langHint={langHint}
-            onStage={onStageHunk ? () => onStageHunk(serializeHunk(h, diff.path), diff.path, diff.staged) : undefined} />
+            action={diff.staged ? "unstage" : "stage"}
+            onStage={onStageHunk ? () => onStageHunk(serializeHunk(h, diff.path), diff.path, diff.staged) : undefined}
+            onStageLine={canStageLines ? (line) => {
+              const patch = serializeSelectedLines(h, diff.path, new Set([line]));
+              if (patch) onStageHunk!(patch, diff.path, false);
+            } : undefined} />
         ))}
       </div>
     </div>
   );
 }
 
-function Hunk({ h, langHint, onStage }: { h: DiffHunk; langHint: string; onStage?: () => void }) {
+function Hunk({ h, langHint, action, onStage, onStageLine }: {
+  h: DiffHunk;
+  langHint: string;
+  action: "stage" | "unstage";
+  onStage?: () => void;
+  onStageLine?: (line: number) => void;
+}) {
   // Highlight each side of the hunk as one contiguous block (so multi-line
   // constructs like block comments / template literals stay correct) instead of
   // highlighting each line in isolation, then map the result back per line.
@@ -42,7 +57,7 @@ function Hunk({ h, langHint, onStage }: { h: DiffHunk; langHint: string; onStage
     <>
       <div className="flex items-center gap-3 px-3 py-0.5 text-[var(--accent-soft)] bg-[color-mix(in_srgb,var(--accent)_8%,transparent)] border-t border-b border-[var(--border)]">
         <span className="mono text-[12px]">{h.header}</span>
-        {onStage && <button className="ml-auto text-[11px] font-bold text-[var(--accent-soft)]" onClick={onStage}>stage hunk</button>}
+        {onStage && <button className="ml-auto text-[11px] font-bold text-[var(--accent-soft)]" onClick={onStage}>{action} hunk</button>}
       </div>
       <div className="mono text-[12.5px] leading-snug">
         {h.lines.map((l, i) => {
@@ -58,7 +73,16 @@ function Hunk({ h, langHint, onStage }: { h: DiffHunk; langHint: string; onStage
               : "text-[var(--faint)]";
           return (
             <div key={i} className={`flex whitespace-pre ${bg}`}>
-              <span className={`w-[30px] text-center select-none ${gut}`}>{l.kind === " " ? "" : l.kind}</span>
+              {onStageLine && l.kind !== " " ? (
+                <button
+                  title={`${action} this line`}
+                  aria-label={`${action} line ${i + 1}`}
+                  className={`w-[30px] text-center select-none hover:font-bold hover:bg-[var(--hover)] ${gut}`}
+                  onClick={() => onStageLine(i)}
+                >{l.kind}</button>
+              ) : (
+                <span className={`w-[30px] text-center select-none ${gut}`}>{l.kind === " " ? "" : l.kind}</span>
+              )}
               <span className="pl-1.5 flex-1" dangerouslySetInnerHTML={{ __html: html[i] ?? "" }} />
             </div>
           );
@@ -134,21 +158,4 @@ function guessLang(path: string): string {
   return ({ ts: "typescript", tsx: "tsx", js: "javascript", jsx: "javascript",
            md: "markdown", json: "json", py: "python", rs: "rust", go: "go",
            sh: "bash", yml: "yaml", yaml: "yaml", css: "css", html: "xml" } as Record<string,string>)[ext] ?? "";
-}
-
-function serializeHunk(h: DiffHunk, path: string): string {
-  const body: string[] = [];
-  for (const l of h.lines) {
-    body.push(l.kind + l.src);
-    // Re-emit git's no-newline marker after the affected line, else `git apply`
-    // can fail or silently re-add a trailing newline on no-EOL files.
-    if (l.noNewline) body.push("\\ No newline at end of file");
-  }
-  return [
-    `diff --git a/${path} b/${path}`,
-    `--- a/${path}`,
-    `+++ b/${path}`,
-    h.header,
-    ...body, "",
-  ].join("\n");
 }
