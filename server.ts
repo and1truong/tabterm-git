@@ -165,6 +165,12 @@ export default function activate(host: ServerHost) {
   // repository's list across a root switch, symlink retarget, or in-place
   // repository replacement.
   const cachedSubmodules = new Map<string, { root: string; real: string; gitIdent: string | null; eagerGen: number; submodules: Submodule[] }>();
+  // Per-workspace status generation, bumped when a mutation's refresh-status
+  // push starts. A poll whose statusWithRaw was awaited across such a bump
+  // discards its result: HEAD-only changes (checkout/reset) leave the
+  // repository identity untouched, so the identity revalidation alone cannot
+  // tell a pre-mutation snapshot from an authoritative one.
+  const statusGen = new Map<string, number>();
   // Per-workspace refresh generations. `refsGen` bumps on every refsMsg start;
   // `eagerGen` bumps only on EAGER refreshes (joins plus tree-changing
   // mutations). An in-flight refresh whose generation is no longer current
@@ -300,15 +306,19 @@ export default function activate(host: ServerHost) {
       const start = await rootForInfo(ctx.key);
       const root = start.root;
       if (!root) return undefined;
+      const statusAtStart = statusGen.get(ctx.key) ?? 0;
       const t = (refsTick.get(ctx.key) ?? 0) + 1;
       refsTick.set(ctx.key, t);
       let out: { snapshot: GitSnapshot; raw: string };
       try { out = await git.statusWithRaw(root); } catch { rootCache.delete(ctx.key); return undefined; }
       // A repository boundary may have changed (e.g. a terminal `git init`)
       // while git status was running — discard the snapshot of the superseded
-      // root instead of caching/pushing it; the next poll recomputes.
+      // root instead of caching/pushing it; the next poll recomputes. A
+      // mutation refresh-status started in the meantime (same-root checkout/
+      // reset) also supersedes this snapshot.
       const latest = await rootForInfo(ctx.key);
       if (latest.root !== start.root || latest.real !== start.real || latest.gitIdent !== start.gitIdent) return undefined;
+      if ((statusGen.get(ctx.key) ?? 0) !== statusAtStart) return undefined;
       // Skip the push entirely when nothing changed (raw stdout AND operation
       // state — a merge/cherry-pick/revert can start without touching files).
       // The host keeps polling regardless of the returned value.
@@ -341,7 +351,7 @@ export default function activate(host: ServerHost) {
       // the background refreshes.
       await refsMsg(ctx.key, true, (m) => peer.send(m), true);
     },
-    onIdle: (key: string) => { latestStatus.delete(key); lastStatusOut.delete(key); refsTick.delete(key); activeJobs.delete(key); rootCache.delete(key); cachedSubmodules.delete(key); refsGen.delete(key); eagerGen.delete(key); },
+    onIdle: (key: string) => { latestStatus.delete(key); lastStatusOut.delete(key); refsTick.delete(key); activeJobs.delete(key); rootCache.delete(key); cachedSubmodules.delete(key); refsGen.delete(key); eagerGen.delete(key); statusGen.delete(key); },
     onRequest: async (ctx: RoomContext, msg: any, peer: Peer) => {
       const err = (m: string) => peer.send({ type: "git:error", tabId: ctx.key, message: m });
       if (msg.type === "git:init") {
@@ -489,22 +499,25 @@ export default function activate(host: ServerHost) {
         // Refresh even after a failed mutation: merge/rebase/pull can leave a
         // valid conflicted operation state that the UI must surface.
         if (refresh) {
-        // Reserve the eager refresh generation as soon as a tree-changing
-        // mutation completes, BEFORE the awaited status and refs refresh below:
-        // a throttled tick overlapping this window would otherwise still match
-        // the pre-mutation cache generation and broadcast stale submodules
-        // ahead of the eager refresh.
+        // Reserve the eager refresh generation AND the status generation as
+        // soon as a tree-changing mutation completes, BEFORE the awaited
+        // status and refs refresh below: a throttled tick or overlapping poll
+        // running in this window would otherwise still match the pre-mutation
+        // cache/fingerprint and broadcast stale data ahead of the eager
+        // refresh.
         if (TREE_CHANGING_MUTATIONS.has(msg.type)) {
           eagerGen.set(ctx.key, (eagerGen.get(ctx.key) ?? 0) + 1);
         }
+        const statusStart = (statusGen.get(ctx.key) ?? 0) + 1;
+        statusGen.set(ctx.key, statusStart);
         let out: { snapshot: GitSnapshot; raw: string };
         try {
           out = await git.statusWithRaw(root);
-          // Discard the refresh snapshot when the workspace root changed while
-          // the request was in flight (same race as the poll path); the next
-          // poll recomputes against the current root.
+          // Discard the refresh snapshot when the workspace root changed or a
+          // NEWER mutation refresh started while the request was in flight
+          // (same race as the poll path); the next poll recomputes.
           const latest = await rootForInfo(ctx.key);
-          if (latest.root === start.root && latest.real === start.real && latest.gitIdent === start.gitIdent) {
+          if (latest.root === start.root && latest.real === start.real && latest.gitIdent === start.gitIdent && statusGen.get(ctx.key) === statusStart) {
             lastStatusOut.set(ctx.key, out.raw + "\u0000" + opKey(out.snapshot.operation));
             latestStatus.set(ctx.key, out.snapshot);
             ctx.push({ type: "git:status", tabId: ctx.key, snapshot: out.snapshot });

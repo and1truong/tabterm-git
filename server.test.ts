@@ -666,10 +666,12 @@ describe("git module: root cache detects repository-boundary changes", () => {
     await git(repo, "commit", "-q", "-m", "add submodule");
     const gm = await readFile(join(repo, ".gitmodules"), "utf8");
     // Uncommitted edit that REALLY changes the parsed list: repoint the
-    // submodule path, so the eagerly refreshed (edited) list differs from the
+    // submodule's path entry (git writes the section header before the
+    // path = line, so replacing "vendor/lib" alone would only rename the
+    // section), making the eagerly refreshed (edited) list differ from the
     // post-discard (committed) list — a cache-reusing push would deliver the
     // wrong path and fail the assertions below.
-    await writeFile(join(repo, ".gitmodules"), gm.replace("vendor/lib", "vendor/alt"));
+    await writeFile(join(repo, ".gitmodules"), gm.replace("path = vendor/lib", "path = vendor/alt"));
     const { host, spec } = fakeHost({ tab1: repo });
     activate(host);
     const { peer } = captureSends();
