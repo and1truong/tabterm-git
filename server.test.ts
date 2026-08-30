@@ -322,4 +322,33 @@ describe("git module: root cache detects repository-boundary changes", () => {
     await rm(linkDir, { recursive: true, force: true });
     await rm(lib, { recursive: true, force: true });
   });
+
+  test("in-place repository replacement invalidates the submodule cache", async () => {
+    const repo = await makeRepo();
+    const lib = await makeRepo();
+    await git(repo, "-c", "protocol.file.allow=always", "submodule", "add", lib, "vendor/lib");
+    await git(repo, "commit", "-q", "-m", "add submodule");
+    const { host, spec } = fakeHost({ tab1: repo });
+    activate(host);
+    const { peer } = captureSends();
+    // Eager join caches the submodule list keyed to the .git identity.
+    await spec().onJoin!(ctxFor("tab1"), peer);
+
+    // Replace the repository in place: same path, same realpath, brand-new
+    // .git. The throttled refs push must not reuse the old repository's
+    // submodules (root/real comparisons alone cannot detect this).
+    await rm(join(repo, ".git"), { recursive: true, force: true });
+    await git(repo, "init", "-q", "-b", "main");
+    const pushed: any[] = [];
+    const ctx = ctxFor("tab1", pushed);
+    for (let i = 0; i < 3; i++) await spec().poll!(ctx);
+    const status = pushed.find((m) => m.type === "git:status");
+    expect(status).toBeDefined();
+    expect(status.snapshot.headSha).toBeNull(); // fresh repo, no commits
+    const refsMsg = pushed.find((m) => m.type === "git:refs");
+    expect(refsMsg).toBeDefined();
+    expect(refsMsg.refs.submodules).toEqual([]);
+    await rm(repo, { recursive: true, force: true });
+    await rm(lib, { recursive: true, force: true });
+  });
 });
