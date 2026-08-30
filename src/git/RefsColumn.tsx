@@ -1,4 +1,4 @@
-import { memo, useEffect, useRef, useState } from "react";
+import { memo, useEffect, useRef, useState, useLayoutEffect } from "react";
 import { useHost } from "../useHost.ts";
 import type { GitRefs, Branch, RemoteBranch, Stash, Submodule } from "../../shared.ts";
 
@@ -329,6 +329,19 @@ function BranchContextMenu({ branch, x, y, onClose, onCheckout, onPush, onMerge,
 }) {
   const ref = useRef<HTMLDivElement>(null);
   const [confirming, setConfirming] = useState<"merge" | "rebase" | null>(null);
+  const [position, setPosition] = useState({ x, y });
+
+  useLayoutEffect(() => {
+    if (!ref.current) return;
+    const rect = ref.current.getBoundingClientRect();
+    const margin = 8;
+    const viewWidth = window.innerWidth;
+    const viewHeight = window.innerHeight;
+    const left = Math.min(Math.max(margin, x), Math.max(margin, viewWidth - rect.width - margin));
+    const top = Math.min(Math.max(margin, y), Math.max(margin, viewHeight - rect.height - margin));
+    if (left !== position.x || top !== position.y) setPosition({ x: left, y: top });
+  }, [x, y, confirming, position.x, position.y]);
+
   useEffect(() => {
     const onPointer = (e: PointerEvent) => {
       if (ref.current && !ref.current.contains(e.target as Node)) onClose();
@@ -344,13 +357,29 @@ function BranchContextMenu({ branch, x, y, onClose, onCheckout, onPush, onMerge,
     };
   }, [onClose]);
 
+  useEffect(() => {
+    if (!ref.current) return;
+    const onResize = () => {
+      const rect = ref.current?.getBoundingClientRect();
+      if (!rect) return;
+      const margin = 8;
+      const viewWidth = window.innerWidth;
+      const viewHeight = window.innerHeight;
+      const left = Math.min(Math.max(margin, position.x), Math.max(margin, viewWidth - rect.width - margin));
+      const top = Math.min(Math.max(margin, position.y), Math.max(margin, viewHeight - rect.height - margin));
+      if (left !== position.x || top !== position.y) setPosition({ x: left, y: top });
+    };
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, [position.x, position.y]);
+
   const publish = branch.upstream === null;
 
   return (
     <div
       ref={ref}
-      className="fixed z-40 min-w-[188px] p-1 rounded-lg bg-[var(--panel)] border border-[var(--border-2)] shadow-xl"
-      style={{ left: x, top: y }}
+      className="fixed z-40 min-w-[188px] max-w-[260px] p-1 rounded-lg bg-[var(--panel)] border border-[var(--border-2)] shadow-xl"
+      style={{ left: position.x, top: position.y, maxHeight: "min(70vh, 360px)", overflowY: "auto" }}
     >
       {!branch.current && (
         <>

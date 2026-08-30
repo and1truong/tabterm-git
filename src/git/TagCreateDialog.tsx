@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import type { GitRefs, GitSnapshot } from "../../shared.ts";
+import { modalBackdropClass, modalShellClass } from "./modalClasses.ts";
 
 interface Props {
   tabId: string;
@@ -59,11 +60,11 @@ export function TagCreateDialog({ tabId, refs, snapshot, onClose, onSend }: Prop
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-[color-mix(in_srgb,var(--bg)_60%,transparent)]"
+      className={modalBackdropClass}
       onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}
     >
       <div
-        className="flex flex-col w-[540px] max-h-[85vh] rounded-xl bg-[var(--panel)] border border-[var(--border)] shadow-2xl"
+        className={modalShellClass}
         role="dialog"
         aria-label="Create tag"
       >

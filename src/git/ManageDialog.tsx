@@ -1,6 +1,7 @@
 import { useState, useEffect } from "react";
 import { useHost } from "../useHost.ts";
 import type { Remote, Submodule, GitSubtree, Worktree } from "../../shared.ts";
+import { modalBackdropClass, modalShellClass } from "./modalClasses.ts";
 
 type Tab = "remotes" | "submodules" | "subtrees" | "worktrees";
 
@@ -38,11 +39,11 @@ export function ManageDialog({ tabId, initialTab, onClose }: Props) {
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-[color-mix(in_srgb,var(--bg)_60%,transparent)]"
+      className={modalBackdropClass}
       onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}
     >
       <div
-        className="flex flex-col w-[640px] max-h-[80vh] rounded-xl bg-[var(--panel)] border border-[var(--border)] shadow-2xl"
+        className={modalShellClass}
         role="dialog"
         aria-label="Manage repository"
       >
