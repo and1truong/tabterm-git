@@ -659,6 +659,35 @@ describe("git module: root cache detects repository-boundary changes", () => {
     await rm(lib, { recursive: true, force: true });
   });
 
+  test("a passive join does not supersede an in-flight mutation eager refresh", async () => {
+    const repo = await makeRepo();
+    await git(repo, "checkout", "-q", "-b", "nosub");
+    await git(repo, "checkout", "-q", "main");
+    const lib = await makeRepo();
+    await git(repo, "-c", "protocol.file.allow=always", "submodule", "add", lib, "vendor/lib");
+    await git(repo, "commit", "-q", "-m", "add submodule");
+    const { host, spec } = fakeHost({ tab1: repo });
+    activate(host);
+    const { peer } = captureSends();
+    await spec().onJoin!(ctxFor("tab1"), peer);
+
+    // A checkout mutation's eager refresh (~130ms incl. submodule status) is
+    // in flight when a second peer joins; the join's own eager refresh must
+    // NOT advance the eager generation, or the mutation's room-wide refresh
+    // would be discarded while the join result only reaches the new peer.
+    const pushed: any[] = [];
+    const ctx = ctxFor("tab1", pushed);
+    const mutP = spec().onRequest!(ctx, { type: "git:checkout", tabId: "tab1", branch: "nosub" }, peer);
+    await Bun.sleep(70);
+    await spec().onJoin!(ctx, captureSends().peer);
+    await mutP;
+    const refsMsgs = pushed.filter((m) => m.type === "git:refs");
+    expect(refsMsgs.length).toBeGreaterThanOrEqual(1); // the mutation's eager refresh survives
+    expect(refsMsgs.at(-1)!.refs.submodules).toEqual([]);
+    await rm(repo, { recursive: true, force: true });
+    await rm(lib, { recursive: true, force: true });
+  });
+
   test("a poll discards a status snapshot for a superseded root", async () => {
     const parent = await makeRepo();
     const work = join(parent, "inner");
