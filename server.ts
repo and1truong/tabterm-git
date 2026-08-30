@@ -163,14 +163,19 @@ export default function activate(host: ServerHost) {
   // sidebar to an empty submodule list — and never leaks a previous
   // repository's list across a root switch, symlink retarget, or in-place
   // repository replacement.
-  const cachedSubmodules = new Map<string, { root: string; real: string; gitIdent: string | null; submodules: Submodule[] }>();
-  // Per-workspace refresh generation, bumped when each refsMsg starts. An
-  // in-flight refresh whose generation is no longer current (a newer refresh —
-  // e.g. a mutation's eager refresh — started after it) discards its result so
-  // it can neither broadcast superseded refs/submodules nor overwrite the
-  // submodule cache with them. Root/realpath/.git identity cannot catch this:
-  // HEAD-only changes (checkout, branchCreate -b) leave all three unchanged.
+  const cachedSubmodules = new Map<string, { root: string; real: string; gitIdent: string | null; eagerGen: number; submodules: Submodule[] }>();
+  // Per-workspace refresh generations. `refsGen` bumps on every refsMsg start;
+  // `eagerGen` bumps only on EAGER refreshes (joins plus tree-changing
+  // mutations). An in-flight refresh whose generation is no longer current
+  // discards its result, but eager refreshes have priority over background
+  // ticks: an eager result is superseded only by a NEWER eager refresh, while
+  // a background result is superseded by any newer refresh and also refuses to
+  // reuse a submodule cache that predates an in-flight eager refresh (the
+  // cache entries carry the eager generation they were written with). Without
+  // this, a tick-3/6 refresh overlapping a mutation's eager refresh could
+  // broadcast stale submodules and get the fresh eager result discarded.
   const refsGen = new Map<string, number>();
+  const eagerGen = new Map<string, number>();
 
   const gitIdentOf = async (root: string | null, cwd: string, real: string): Promise<string | null> =>
     root === null ? null : await pathIdentity(joinPath(root === cwd ? real : root, ".git"));
@@ -193,6 +198,8 @@ export default function activate(host: ServerHost) {
   async function refsMsg(key: string, includeSubmodules = false) {
     const gen = (refsGen.get(key) ?? 0) + 1;
     refsGen.set(key, gen);
+    const isEager = includeSubmodules;
+    if (isEager) eagerGen.set(key, gen);
     const start = await rootForInfo(key);
     const root = start.root;
     if (!root) return { type: "git:refs", tabId: key, refs: emptyRefs() };
@@ -206,12 +213,22 @@ export default function activate(host: ServerHost) {
         submodules = await git.submodules(root);
       } else {
         // Throttled ticks reuse the last successful list — but only for the
-        // same root, realpath target, AND .git identity, so a
-        // repository-boundary change (nested `git init`), symlink retarget, or
-        // in-place replacement never broadcasts the previous repository's
-        // submodules.
+        // same root, realpath target, AND .git identity (a diverging identity
+        // means the repository was replaced: an empty list is factually
+        // correct for a fresh repo, never a leak of the previous one), and
+        // only when no eager refresh has started since the cache was written
+        // (its eager generation still matches): reusing a cache an eager
+        // refresh is about to update would broadcast mixed refs + stale
+        // submodules, so that push is skipped entirely.
         const cached = cachedSubmodules.get(key);
-        submodules = cached && cached.root === root && cached.real === start.real && cached.gitIdent === start.gitIdent ? cached.submodules : [];
+        const cacheSafe = !!cached && cached.root === root && cached.real === start.real && cached.gitIdent === start.gitIdent;
+        if (cacheSafe && cached!.eagerGen === (eagerGen.get(key) ?? 0)) {
+          submodules = cached!.submodules;
+        } else if (cacheSafe) {
+          return null;
+        } else {
+          submodules = [];
+        }
       }
       // Revalidate AFTER every awaited subprocess — a repository boundary may
       // have changed (e.g. a terminal `git init`) or the cwd symlink been
@@ -221,13 +238,15 @@ export default function activate(host: ServerHost) {
       // recomputes against the new root.
       const latest = await rootForInfo(key);
       if (latest.root !== start.root || latest.real !== start.real || latest.gitIdent !== start.gitIdent) return null;
-      // A newer refresh started while this one was running (e.g. a mutation's
-      // eager refresh): discard so the older result cannot broadcast or
-      // overwrite the submodule cache after the newer one.
-      if (refsGen.get(key) !== gen) return null;
+      // A newer refresh started while this one was running. Eager refreshes
+      // (joins, tree-changing mutations) have priority: only a newer EAGER
+      // supersedes one, while a background tick is superseded by any newer
+      // refresh — otherwise a tick overlapping a mutation's eager refresh
+      // would broadcast mixed data and discard the fresh eager result.
+      if (isEager ? (eagerGen.get(key) !== gen) : (refsGen.get(key) !== gen)) return null;
       const current = all.branches.find((b) => b.current)?.name ?? null;
       const refs: GitRefs = { branches: all.branches, remoteBranches: all.remoteBranches, current, remotes, stashes, tags: all.tags, submodules, worktrees };
-      if (due) cachedSubmodules.set(key, { root, real: start.real, gitIdent: start.gitIdent, submodules });
+      if (due) cachedSubmodules.set(key, { root, real: start.real, gitIdent: start.gitIdent, submodules, eagerGen: eagerGen.get(key) ?? 0 });
       return { type: "git:refs", tabId: key, refs };
     } catch (e) {
       return { type: "git:error", tabId: key, message: `Unable to refresh refs: ${(e as Error).message}` };
@@ -286,7 +305,7 @@ export default function activate(host: ServerHost) {
       const refs = await refsMsg(ctx.key, true);
       if (refs) peer.send(refs);
     },
-    onIdle: (key: string) => { latestStatus.delete(key); lastStatusOut.delete(key); refsTick.delete(key); activeJobs.delete(key); rootCache.delete(key); cachedSubmodules.delete(key); refsGen.delete(key); },
+    onIdle: (key: string) => { latestStatus.delete(key); lastStatusOut.delete(key); refsTick.delete(key); activeJobs.delete(key); rootCache.delete(key); cachedSubmodules.delete(key); refsGen.delete(key); eagerGen.delete(key); },
     onRequest: async (ctx: RoomContext, msg: any, peer: Peer) => {
       const err = (m: string) => peer.send({ type: "git:error", tabId: ctx.key, message: m });
       if (msg.type === "git:init") {
