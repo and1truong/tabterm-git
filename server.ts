@@ -36,7 +36,9 @@ function opKey(op: GitOperation | null): string {
 //   - regular-file gitfile (linked worktrees / submodules): content hash
 //     catches in-place pointer rewrites; the resolved gitdir target's own
 //     identity catches replacing/retargeting the target behind an unchanged
-//     pointer.
+//     pointer; a worktree admin's commondir text plus the resolved common
+//     dir identity catches in-place administrative rewrites that retarget
+//     the shared repository.
 function hashString(s: string): number {
   let h = 2166136261;
   for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); }
@@ -64,7 +66,25 @@ async function pathIdentity(p: string): Promise<string | null> {
       if (resolved) {
         try {
           const tst = await pathStat(resolved);
-          return `f:${st.dev}:${st.ino}:${st.birthtimeMs || st.ctimeMs}:${hashString(content)}:${tst.dev}:${tst.ino}:${tst.birthtimeMs || tst.ctimeMs}`;
+          let common = "";
+          if (tst.isDirectory()) {
+            // A worktree admin dir selects its shared repository via the
+            // commondir file. Rewriting it in place (or the HEAD/index it
+            // pairs with) is invisible to the directory's own dev/ino/
+            // birthtime, so fold both the commondir text and the resolved
+            // common dir's identity in.
+            const cd = await pathReadFile(joinPath(resolved, "commondir"), "utf8").catch(() => null);
+            if (cd !== null) {
+              const text = cd.trim();
+              common = `:${hashString(text)}`;
+              const commonDir = await pathRealpath(pathResolve(resolved, text)).catch(() => null);
+              if (commonDir) {
+                const cst = await pathStat(commonDir).catch(() => null);
+                if (cst) common += `:${cst.dev}:${cst.ino}:${cst.birthtimeMs || cst.ctimeMs}`;
+              }
+            }
+          }
+          return `f:${st.dev}:${st.ino}:${st.birthtimeMs || st.ctimeMs}:${hashString(content)}:${tst.dev}:${tst.ino}:${tst.birthtimeMs || tst.ctimeMs}${common}`;
         } catch { /* fall through to pointer-only identity */ }
       }
     }

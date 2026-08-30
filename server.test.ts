@@ -431,4 +431,47 @@ describe("git module: root cache detects repository-boundary changes", () => {
     await rm(r2, { recursive: true, force: true });
     await rm(lib, { recursive: true, force: true });
   });
+
+  test("in-place admin rewrite retargeting the common repo invalidates the cache", async () => {
+    const r1 = await makeRepo();
+    const lib = await makeRepo();
+    await git(r1, "-c", "protocol.file.allow=always", "submodule", "add", lib, "vendor/lib");
+    await git(r1, "commit", "-q", "-m", "add submodule");
+    const r2 = await makeRepo();
+    const wd = await mkdtemp(join(tmpdir(), "tabterm-gitfile-wt3-"));
+    const w1 = join(wd, "w1");
+    const w2 = join(wd, "w2");
+    await git(r1, "worktree", "add", "-q", "-b", "linked1", w1);
+    await git(r2, "worktree", "add", "-q", "-b", "linked2", w2);
+    const { host, spec } = fakeHost({ tab1: w1 });
+    activate(host);
+    const { peer } = captureSends();
+    await spec().onJoin!(ctxFor("tab1"), peer);
+
+    // Rewrite w1's admin dir IN PLACE: commondir now names r2's common dir
+    // (absolute), HEAD and index copied from w2's admin. The admin dir itself
+    // keeps its device, inode, and birthtime, and w1's .git gitfile text is
+    // untouched — only the commondir component of the identity can catch this.
+    const adminOf = async (w: string): Promise<string> =>
+      pathResolve(w, (await readFile(join(w, ".git"), "utf8")).match(/^gitdir:\s*(.+?)\s*$/m)![1]!);
+    const admin1 = await adminOf(w1);
+    const admin2 = await adminOf(w2);
+    await writeFile(join(admin1, "commondir"), (await realpath(join(r2, ".git"))) + "\n");
+    await writeFile(join(admin1, "HEAD"), await readFile(join(admin2, "HEAD")));
+    await writeFile(join(admin1, "index"), await readFile(join(admin2, "index")));
+
+    const pushed: any[] = [];
+    const ctx = ctxFor("tab1", pushed);
+    for (let i = 0; i < 3; i++) await spec().poll!(ctx);
+    const refsMsg = pushed.find((m) => m.type === "git:refs");
+    expect(refsMsg).toBeDefined();
+    const branchNames = refsMsg.refs.branches.map((b: any) => b.name);
+    expect(branchNames).toContain("linked2");
+    expect(branchNames).not.toContain("linked1");
+    expect(refsMsg.refs.submodules).toEqual([]);
+    await rm(wd, { recursive: true, force: true });
+    await rm(r1, { recursive: true, force: true });
+    await rm(r2, { recursive: true, force: true });
+    await rm(lib, { recursive: true, force: true });
+  });
 });
