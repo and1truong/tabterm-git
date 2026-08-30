@@ -22,6 +22,7 @@ const TREE_CHANGING_MUTATIONS = new Set([
   "git:cherry-pick", "git:revert", "git:reset", "git:operationAction", "git:bisect",
   "git:stashCreate", "git:stashApply", "git:resolveConflict", "git:resolveConflictSide",
   "git:branchCreate", // checkout: true runs `git checkout -b` and switches the tree
+  "git:discard", // may restore or delete .gitmodules in the working tree
   "git:submoduleUpdate", "git:submoduleUpdateRemote", "git:subtreeSync",
 ]);
 
@@ -420,7 +421,7 @@ export default function activate(host: ServerHost) {
           case "git:stage":   refresh = true; await git.stage(root, msg.paths); break;
           case "git:unstage": refresh = true; await git.unstage(root, msg.paths); break;
           case "git:stageHunk": refresh = true; await git.stageHunk(root, msg.patch, msg.staged, msg.path); break;
-          case "git:discard": refresh = true; await git.discard(root, msg.paths); break;
+          case "git:discard": refresh = true; refsChanged = true; await git.discard(root, msg.paths); break;
           case "git:ignore": refresh = true; await git.ignore(root, msg.paths); break;
           case "git:resolveConflict":
             refresh = true; refsChanged = true; // a resolved .gitmodules may change the submodule list

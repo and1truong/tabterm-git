@@ -659,6 +659,31 @@ describe("git module: root cache detects repository-boundary changes", () => {
     await rm(lib, { recursive: true, force: true });
   });
 
+  test("discarding .gitmodules changes triggers an eager submodule refresh", async () => {
+    const repo = await makeRepo();
+    const lib = await makeRepo();
+    await git(repo, "-c", "protocol.file.allow=always", "submodule", "add", lib, "vendor/lib");
+    await git(repo, "commit", "-q", "-m", "add submodule");
+    const gm = await readFile(join(repo, ".gitmodules"), "utf8");
+    const { host, spec } = fakeHost({ tab1: repo });
+    activate(host);
+    const { peer } = captureSends();
+    await spec().onJoin!(ctxFor("tab1"), peer);
+
+    // A working-tree edit of .gitmodules is discarded; the eager refresh must
+    // run so the sidebar shows the restored (committed) submodule list instead
+    // of the stale edited one until the cadence.
+    await writeFile(join(repo, ".gitmodules"), gm + "# edited-but-uncommitted\n");
+    const pushed: any[] = [];
+    const ctx = ctxFor("tab1", pushed);
+    await spec().onRequest!(ctx, { type: "git:discard", tabId: "tab1", paths: [".gitmodules"] }, peer);
+    const refsMsgs = pushed.filter((m) => m.type === "git:refs");
+    expect(refsMsgs.length).toBeGreaterThanOrEqual(1);
+    expect(refsMsgs.at(-1)!.refs.submodules).toHaveLength(1); // restored list
+    await rm(repo, { recursive: true, force: true });
+    await rm(lib, { recursive: true, force: true });
+  });
+
   test("a passive join does not supersede an in-flight mutation eager refresh", async () => {
     const repo = await makeRepo();
     await git(repo, "checkout", "-q", "-b", "nosub");
