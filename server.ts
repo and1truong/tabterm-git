@@ -454,6 +454,14 @@ export default function activate(host: ServerHost) {
         // Refresh even after a failed mutation: merge/rebase/pull can leave a
         // valid conflicted operation state that the UI must surface.
         if (refresh) {
+        // Reserve the eager refresh generation as soon as a tree-changing
+        // mutation completes, BEFORE the awaited status and refs refresh below:
+        // a throttled tick overlapping this window would otherwise still match
+        // the pre-mutation cache generation and broadcast stale submodules
+        // ahead of the eager refresh.
+        if (TREE_CHANGING_MUTATIONS.has(msg.type)) {
+          eagerGen.set(ctx.key, (eagerGen.get(ctx.key) ?? 0) + 1);
+        }
         let out: { snapshot: GitSnapshot; raw: string };
         try {
           out = await git.statusWithRaw(root);

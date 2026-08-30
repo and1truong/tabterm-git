@@ -598,6 +598,37 @@ describe("git module: root cache detects repository-boundary changes", () => {
     await rm(lib, { recursive: true, force: true });
   });
 
+  test("a tick overlapping the post-mutation status window skips the stale cache", async () => {
+    const repo = await makeRepo();
+    await git(repo, "checkout", "-q", "-b", "nosub");
+    await git(repo, "checkout", "-q", "main");
+    const lib = await makeRepo();
+    await git(repo, "-c", "protocol.file.allow=always", "submodule", "add", lib, "vendor/lib");
+    await git(repo, "commit", "-q", "-m", "add submodule");
+    const { host, spec } = fakeHost({ tab1: repo });
+    activate(host);
+    const { peer } = captureSends();
+    await spec().onJoin!(ctxFor("tab1"), peer);
+    await spec().poll!(ctxFor("tab1"));
+    await spec().poll!(ctxFor("tab1"));
+
+    // The checkout completes ~15ms in; the eager refresh generation is
+    // reserved right after, before the finally block's awaited status. The
+    // tick-3 refresh started meanwhile must NOT reuse the pre-mutation cache.
+    const pushed: any[] = [];
+    const ctx = ctxFor("tab1", pushed);
+    const mutP = spec().onRequest!(ctx, { type: "git:checkout", tabId: "tab1", branch: "nosub" }, peer);
+    await Bun.sleep(15);
+    await spec().poll!(ctx); // tick 3, overlapping the mutation's status window
+    await mutP;
+    const refsMsgs = pushed.filter((m) => m.type === "git:refs");
+    expect(refsMsgs.length).toBeGreaterThanOrEqual(1);
+    expect(refsMsgs.at(-1)!.refs.submodules).toEqual([]);
+    expect(refsMsgs.some((m) => m.refs.submodules.length === 1)).toBe(false);
+    await rm(repo, { recursive: true, force: true });
+    await rm(lib, { recursive: true, force: true });
+  });
+
   test("a poll discards a status snapshot for a superseded root", async () => {
     const parent = await makeRepo();
     const work = join(parent, "inner");
