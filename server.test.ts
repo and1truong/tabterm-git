@@ -665,21 +665,25 @@ describe("git module: root cache detects repository-boundary changes", () => {
     await git(repo, "-c", "protocol.file.allow=always", "submodule", "add", lib, "vendor/lib");
     await git(repo, "commit", "-q", "-m", "add submodule");
     const gm = await readFile(join(repo, ".gitmodules"), "utf8");
+    // Uncommitted edit that REALLY changes the parsed list: repoint the
+    // submodule path, so the eagerly refreshed (edited) list differs from the
+    // post-discard (committed) list — a cache-reusing push would deliver the
+    // wrong path and fail the assertions below.
+    await writeFile(join(repo, ".gitmodules"), gm.replace("vendor/lib", "vendor/alt"));
     const { host, spec } = fakeHost({ tab1: repo });
     activate(host);
     const { peer } = captureSends();
-    await spec().onJoin!(ctxFor("tab1"), peer);
+    await spec().onJoin!(ctxFor("tab1"), peer); // caches the EDITED list [vendor/alt]
 
-    // A working-tree edit of .gitmodules is discarded; the eager refresh must
-    // run so the sidebar shows the restored (committed) submodule list instead
-    // of the stale edited one until the cadence.
-    await writeFile(join(repo, ".gitmodules"), gm + "# edited-but-uncommitted\n");
+    // Discarding restores the committed .gitmodules; the eager refresh must
+    // run so the sidebar shows the restored [vendor/lib] instead of the stale
+    // cached [vendor/alt] until the cadence.
     const pushed: any[] = [];
     const ctx = ctxFor("tab1", pushed);
     await spec().onRequest!(ctx, { type: "git:discard", tabId: "tab1", paths: [".gitmodules"] }, peer);
     const refsMsgs = pushed.filter((m) => m.type === "git:refs");
     expect(refsMsgs.length).toBeGreaterThanOrEqual(1);
-    expect(refsMsgs.at(-1)!.refs.submodules).toHaveLength(1); // restored list
+    expect(refsMsgs.at(-1)!.refs.submodules.map((s: any) => s.path)).toEqual(["vendor/lib"]); // restored, not the cached edited list
     await rm(repo, { recursive: true, force: true });
     await rm(lib, { recursive: true, force: true });
   });
