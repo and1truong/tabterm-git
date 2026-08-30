@@ -524,6 +524,45 @@ describe("git module: root cache detects repository-boundary changes", () => {
     await rm(lib, { recursive: true, force: true });
   });
 
+  test("an in-flight throttled refresh is discarded when a mutation's eager refresh supersedes it", async () => {
+    const repo = await makeRepo();
+    await git(repo, "checkout", "-q", "-b", "nosub");
+    await git(repo, "checkout", "-q", "main");
+    const lib = await makeRepo();
+    await git(repo, "-c", "protocol.file.allow=always", "submodule", "add", lib, "vendor/lib");
+    await git(repo, "commit", "-q", "-m", "add submodule");
+    const { host, spec } = fakeHost({ tab1: repo });
+    activate(host);
+    const { peer } = captureSends();
+    await spec().onJoin!(ctxFor("tab1"), peer);
+
+    // Pump ticks 1..8 (refs pushes at ticks 3 and 6 land in the throwaway ctx).
+    await spec().poll!(ctxFor("tab1"));
+    await spec().poll!(ctxFor("tab1"));
+    await spec().poll!(ctxFor("tab1"));
+    await spec().poll!(ctxFor("tab1"));
+    await spec().poll!(ctxFor("tab1"));
+    await spec().poll!(ctxFor("tab1"));
+    await spec().poll!(ctxFor("tab1"));
+    await spec().poll!(ctxFor("tab1"));
+
+    // Tick 9 starts a throttled refresh (submodule cadence due, ~130ms of
+    // subprocesses). A checkout mutation lands mid-flight and starts its own
+    // EAGER refresh (generation supersedes the tick's); the tick's completed
+    // result must be discarded so it cannot broadcast pre-mutation refs or
+    // overwrite the submodule cache after the eager refresh.
+    const pushed: any[] = [];
+    const ctx = ctxFor("tab1", pushed);
+    const pollP = spec().poll!(ctx);
+    await spec().onRequest!(ctx, { type: "git:checkout", tabId: "tab1", branch: "nosub" }, peer);
+    await pollP;
+    const refsMsgs = pushed.filter((m) => m.type === "git:refs");
+    expect(refsMsgs).toHaveLength(1); // only the eager (post-mutation) refresh
+    expect(refsMsgs[0]!.refs.submodules).toEqual([]);
+    await rm(repo, { recursive: true, force: true });
+    await rm(lib, { recursive: true, force: true });
+  });
+
   test("a poll discards a status snapshot for a superseded root", async () => {
     const parent = await makeRepo();
     const work = join(parent, "inner");

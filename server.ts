@@ -164,6 +164,13 @@ export default function activate(host: ServerHost) {
   // repository's list across a root switch, symlink retarget, or in-place
   // repository replacement.
   const cachedSubmodules = new Map<string, { root: string; real: string; gitIdent: string | null; submodules: Submodule[] }>();
+  // Per-workspace refresh generation, bumped when each refsMsg starts. An
+  // in-flight refresh whose generation is no longer current (a newer refresh —
+  // e.g. a mutation's eager refresh — started after it) discards its result so
+  // it can neither broadcast superseded refs/submodules nor overwrite the
+  // submodule cache with them. Root/realpath/.git identity cannot catch this:
+  // HEAD-only changes (checkout, branchCreate -b) leave all three unchanged.
+  const refsGen = new Map<string, number>();
 
   const gitIdentOf = async (root: string | null, cwd: string, real: string): Promise<string | null> =>
     root === null ? null : await pathIdentity(joinPath(root === cwd ? real : root, ".git"));
@@ -184,6 +191,8 @@ export default function activate(host: ServerHost) {
   const rootFor = async (key: string): Promise<string | null> => (await rootForInfo(key)).root;
 
   async function refsMsg(key: string, includeSubmodules = false) {
+    const gen = (refsGen.get(key) ?? 0) + 1;
+    refsGen.set(key, gen);
     const start = await rootForInfo(key);
     const root = start.root;
     if (!root) return { type: "git:refs", tabId: key, refs: emptyRefs() };
@@ -212,6 +221,10 @@ export default function activate(host: ServerHost) {
       // recomputes against the new root.
       const latest = await rootForInfo(key);
       if (latest.root !== start.root || latest.real !== start.real || latest.gitIdent !== start.gitIdent) return null;
+      // A newer refresh started while this one was running (e.g. a mutation's
+      // eager refresh): discard so the older result cannot broadcast or
+      // overwrite the submodule cache after the newer one.
+      if (refsGen.get(key) !== gen) return null;
       const current = all.branches.find((b) => b.current)?.name ?? null;
       const refs: GitRefs = { branches: all.branches, remoteBranches: all.remoteBranches, current, remotes, stashes, tags: all.tags, submodules, worktrees };
       if (due) cachedSubmodules.set(key, { root, real: start.real, gitIdent: start.gitIdent, submodules });
@@ -273,7 +286,7 @@ export default function activate(host: ServerHost) {
       const refs = await refsMsg(ctx.key, true);
       if (refs) peer.send(refs);
     },
-    onIdle: (key: string) => { latestStatus.delete(key); lastStatusOut.delete(key); refsTick.delete(key); activeJobs.delete(key); rootCache.delete(key); cachedSubmodules.delete(key); },
+    onIdle: (key: string) => { latestStatus.delete(key); lastStatusOut.delete(key); refsTick.delete(key); activeJobs.delete(key); rootCache.delete(key); cachedSubmodules.delete(key); refsGen.delete(key); },
     onRequest: async (ctx: RoomContext, msg: any, peer: Peer) => {
       const err = (m: string) => peer.send({ type: "git:error", tabId: ctx.key, message: m });
       if (msg.type === "git:init") {
