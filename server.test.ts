@@ -1,5 +1,5 @@
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
-import { mkdtemp, mkdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "bun";
@@ -349,6 +349,45 @@ describe("git module: root cache detects repository-boundary changes", () => {
     expect(refsMsg).toBeDefined();
     expect(refsMsg.refs.submodules).toEqual([]);
     await rm(repo, { recursive: true, force: true });
+    await rm(lib, { recursive: true, force: true });
+  });
+
+  test("in-place gitfile rewrite invalidates the root cache", async () => {
+    // r1 carries a submodule and gets a linked worktree; r2 is a plain repo
+    // with its own linked worktree, so both worktrees have real .git gitfiles.
+    const r1 = await makeRepo();
+    const lib = await makeRepo();
+    await git(r1, "-c", "protocol.file.allow=always", "submodule", "add", lib, "vendor/lib");
+    await git(r1, "commit", "-q", "-m", "add submodule");
+    const r2 = await makeRepo();
+    const wd = await mkdtemp(join(tmpdir(), "tabterm-gitfile-wt-"));
+    const w1 = join(wd, "w1");
+    const w2 = join(wd, "w2");
+    await git(r1, "worktree", "add", "-q", "-b", "linked1", w1);
+    await git(r2, "worktree", "add", "-q", "-b", "linked2", w2);
+    const { host, spec } = fakeHost({ tab1: w1 });
+    activate(host);
+    const { peer } = captureSends();
+    // Eager join caches r1's submodule list for the w1 worktree.
+    await spec().onJoin!(ctxFor("tab1"), peer);
+
+    // Rewrite w1/.git in place to point at r2's worktree gitdir: same path,
+    // same inode, same birthtime — only the gitfile contents change.
+    const w2Gitfile = await readFile(join(w2, ".git"), "utf8");
+    await writeFile(join(w1, ".git"), w2Gitfile);
+    const pushed: any[] = [];
+    const ctx = ctxFor("tab1", pushed);
+    for (let i = 0; i < 3; i++) await spec().poll!(ctx);
+    const refsMsg = pushed.find((m) => m.type === "git:refs");
+    expect(refsMsg).toBeDefined();
+    // The refs now come from r2's worktree, and r1's submodule list is not reused.
+    const branchNames = refsMsg.refs.branches.map((b: any) => b.name);
+    expect(branchNames).toContain("linked2");
+    expect(branchNames).not.toContain("linked1");
+    expect(refsMsg.refs.submodules).toEqual([]);
+    await rm(wd, { recursive: true, force: true });
+    await rm(r1, { recursive: true, force: true });
+    await rm(r2, { recursive: true, force: true });
     await rm(lib, { recursive: true, force: true });
   });
 });

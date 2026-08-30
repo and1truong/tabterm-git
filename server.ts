@@ -1,7 +1,7 @@
 import type { ServerHost, RoomContext, Peer } from "@tabterm/module-host/server";
 import * as git from "./server/git.ts";
 import type { GitSnapshot, GitRefs, GitJob, GitOperation, Submodule } from "./shared.ts";
-import { stat as pathStat, realpath as pathRealpath } from "node:fs/promises";
+import { stat as pathStat, realpath as pathRealpath, readFile as pathReadFile } from "node:fs/promises";
 import { dirname as pathDirname, join as joinPath } from "node:path";
 import { subtreeMigrations } from "./server/subtreeMigrations.ts";
 import { makeSubtreeDb } from "./server/subtreeDb.ts";
@@ -25,16 +25,31 @@ function opKey(op: GitOperation | null): string {
   return op ? `${op.type}:${op.current ?? "-"}:${op.total ?? "-"}` : "-";
 }
 
-// Filesystem identity of a path (device + inode + creation time), used to
-// detect a repository replaced in place (e.g. `rm -rf .git && git init`) where
-// path existence, root, and realpath target all stay the same. dev:ino alone
-// can be reused when a directory is deleted and recreated on many filesystems,
-// so birthtime (creation time) is included as a monotonic generation
-// component; ctime is the fallback where birthtime is unsupported.
+// Filesystem identity of a repository marker (.git), used to detect a
+// repository replaced in place (e.g. `rm -rf .git && git init`) where path
+// existence, root, and realpath target all stay the same. dev:ino alone can be
+// reused when a directory is deleted and recreated on many filesystems, so a
+// generation component is included:
+//   - directory marker: birthtime (creation time) is monotonic and immutable
+//     across normal git activity inside an existing .git (ctime of the
+//     directory changes on every entry write, so it is not used);
+//   - regular-file gitfile (linked worktrees / submodules): an in-place
+//     rewrite preserving dev/ino/birthtime is caught by hashing the file's
+//     contents (the gitdir target).
+function hashString(s: string): number {
+  let h = 2166136261;
+  for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); }
+  return h >>> 0;
+}
+
 async function pathIdentity(p: string): Promise<string | null> {
   try {
     const st = await pathStat(p);
-    return `${st.dev}:${st.ino}:${st.birthtimeMs || st.ctimeMs}`;
+    if (st.isDirectory()) {
+      return `d:${st.dev}:${st.ino}:${st.birthtimeMs || st.ctimeMs}`;
+    }
+    const content = await pathReadFile(p, "utf8");
+    return `f:${st.dev}:${st.ino}:${st.birthtimeMs || st.ctimeMs}:${hashString(content)}`;
   } catch {
     return null;
   }
