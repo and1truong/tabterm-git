@@ -272,10 +272,12 @@ export default function activate(host: ServerHost) {
       // Superseded or old-root errors must not be delivered either: the client
       // stores git:error persistently and a later successful git:refs message
       // does not clear it, so an obsolete error would linger after the
-      // authoritative refresh succeeded.
-      if (superseded()) return;
+      // authoritative refresh succeeded. All guards run AFTER the awaited
+      // identity revalidation — the generation check passes as the final
+      // synchronous step before delivery.
       const latest = await rootForInfo(key);
       if (latest.root !== start.root || latest.real !== start.real || latest.gitIdent !== start.gitIdent) return;
+      if (superseded()) return;
       push({ type: "git:error", tabId: key, message: `Unable to refresh refs: ${(e as Error).message}` });
     }
   }
