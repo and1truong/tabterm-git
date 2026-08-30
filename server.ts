@@ -220,7 +220,14 @@ export default function activate(host: ServerHost) {
     // started after this one — or, for passive joins, when the eager
     // generation advanced after they started.
     const superseded = (): boolean => {
-      if (isEager) return passive ? (eagerGen.get(key) ?? 0) !== eagerAtStart : eagerGen.get(key) !== gen;
+      if (isEager) {
+        // An eager result is superseded by a newer eager (or reservation); a
+        // passive join additionally yields to ANY newer refresh (refsGen
+        // advance) so an older join cannot deliver (or error) after an
+        // authoritative room refresh.
+        if (passive) return (refsGen.get(key) ?? 0) !== genAtStart || (eagerGen.get(key) ?? 0) !== eagerAtStart;
+        return eagerGen.get(key) !== gen;
+      }
       return (refsGen.get(key) !== (passive ? genAtStart : gen)) || (eagerGen.get(key) ?? 0) !== eagerAtStart;
     };
     const start = await rootForInfo(key);
