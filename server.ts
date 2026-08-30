@@ -25,14 +25,16 @@ function opKey(op: GitOperation | null): string {
   return op ? `${op.type}:${op.current ?? "-"}:${op.total ?? "-"}` : "-";
 }
 
-// Filesystem identity of a path (device + inode), used to detect a repository
-// replaced in place (e.g. `rm -rf .git && git init`) where path existence,
-// root, and realpath target all stay the same. Git itself keys its stat cache
-// on these same fields.
+// Filesystem identity of a path (device + inode + creation time), used to
+// detect a repository replaced in place (e.g. `rm -rf .git && git init`) where
+// path existence, root, and realpath target all stay the same. dev:ino alone
+// can be reused when a directory is deleted and recreated on many filesystems,
+// so birthtime (creation time) is included as a monotonic generation
+// component; ctime is the fallback where birthtime is unsupported.
 async function pathIdentity(p: string): Promise<string | null> {
   try {
     const st = await pathStat(p);
-    return `${st.dev}:${st.ino}`;
+    return `${st.dev}:${st.ino}:${st.birthtimeMs || st.ctimeMs}`;
   } catch {
     return null;
   }
