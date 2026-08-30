@@ -474,4 +474,54 @@ describe("git module: root cache detects repository-boundary changes", () => {
     await rm(r2, { recursive: true, force: true });
     await rm(lib, { recursive: true, force: true });
   });
+
+  test("tree-changing mutations eagerly refresh the submodule list", async () => {
+    const repo = await makeRepo();
+    await git(repo, "checkout", "-q", "-b", "nosub"); // branch WITHOUT the submodule
+    await git(repo, "checkout", "-q", "main");
+    const lib = await makeRepo();
+    await git(repo, "-c", "protocol.file.allow=always", "submodule", "add", lib, "vendor/lib");
+    await git(repo, "commit", "-q", "-m", "add submodule");
+    const { host, spec } = fakeHost({ tab1: repo });
+    activate(host);
+    const { peer } = captureSends();
+    // Eager join caches the submodule list of the submodule-carrying branch.
+    await spec().onJoin!(ctxFor("tab1"), peer);
+
+    // Checkout to the pre-submodule branch replaces the tree (and .gitmodules);
+    // the refs push after the mutation must carry an eagerly refreshed — now
+    // empty — list rather than the cached one.
+    const pushed: any[] = [];
+    await spec().onRequest!(ctxFor("tab1", pushed), { type: "git:checkout", tabId: "tab1", branch: "nosub" }, peer);
+    const refsMsg = pushed.find((m) => m.type === "git:refs");
+    expect(refsMsg).toBeDefined();
+    expect(refsMsg.refs.submodules).toEqual([]);
+    await rm(repo, { recursive: true, force: true });
+    await rm(lib, { recursive: true, force: true });
+  });
+
+  test("a poll discards a status snapshot for a superseded root", async () => {
+    const parent = await makeRepo();
+    const work = join(parent, "inner");
+    await mkdir(work);
+    const { host, spec } = fakeHost({ tab1: work });
+    activate(host);
+    await spec().poll!(ctxFor("tab1")); // pre-cache the parent root
+
+    // Start a poll and switch the repository boundary while git status is
+    // running; the completed snapshot must be discarded, not pushed.
+    const pushed: any[] = [];
+    const ctx = ctxFor("tab1", pushed);
+    const pollP = spec().poll!(ctx);
+    await git(work, "init", "-q", "-b", "main");
+    await pollP;
+    expect(pushed.filter((m) => m.type === "git:status")).toEqual([]);
+
+    // The next poll computes against the new repository and pushes.
+    await spec().poll!(ctx);
+    const status = pushed.find((m) => m.type === "git:status");
+    expect(status).toBeDefined();
+    expect(status.snapshot.headSha).toBeNull();
+    await rm(parent, { recursive: true, force: true });
+  });
 });

@@ -14,7 +14,15 @@ const REFS_EVERY = 3; // ~4.5s at 1.5s poll
 // piggybacking on every refs refresh. Changed/conflicted submodules still
 // surface immediately through the porcelain status poll.
 const SUBMODULES_EVERY = 9;
-const SUBMODULE_MUTATIONS = new Set(["git:submoduleUpdate", "git:submoduleUpdateRemote", "git:subtreeSync"]);
+// Mutations that may replace the checked-out tree — and therefore .gitmodules
+// and the submodule list — force an eager `git submodule status` on their
+// refs refresh instead of reusing the cached list on a throttled tick.
+const TREE_CHANGING_MUTATIONS = new Set([
+  "git:checkout", "git:checkoutRemote", "git:pull", "git:merge", "git:rebase", "git:interactiveRebase",
+  "git:cherry-pick", "git:revert", "git:reset", "git:operationAction", "git:bisect",
+  "git:stashCreate", "git:stashApply", "git:resolveConflict", "git:resolveConflictSide",
+  "git:submoduleUpdate", "git:submoduleUpdateRemote", "git:subtreeSync",
+]);
 
 function emptyRefs(): GitRefs {
   return { branches: [], remoteBranches: [], current: null, remotes: [], stashes: [], tags: [], submodules: [], worktrees: [] };
@@ -219,12 +227,18 @@ export default function activate(host: ServerHost) {
     unsubscribeType: "git:unsubscribe",
     pollMs: POLL_MS,
     poll: async (ctx: RoomContext) => {
-      const root = await rootFor(ctx.key);
+      const start = await rootForInfo(ctx.key);
+      const root = start.root;
       if (!root) return undefined;
       const t = (refsTick.get(ctx.key) ?? 0) + 1;
       refsTick.set(ctx.key, t);
       let out: { snapshot: GitSnapshot; raw: string };
       try { out = await git.statusWithRaw(root); } catch { rootCache.delete(ctx.key); return undefined; }
+      // A repository boundary may have changed (e.g. a terminal `git init`)
+      // while git status was running — discard the snapshot of the superseded
+      // root instead of caching/pushing it; the next poll recomputes.
+      const latest = await rootForInfo(ctx.key);
+      if (latest.root !== start.root || latest.real !== start.real || latest.gitIdent !== start.gitIdent) return undefined;
       // Skip the push entirely when nothing changed (raw stdout AND operation
       // state — a merge/cherry-pick/revert can start without touching files).
       // The host keeps polling regardless of the returned value.
@@ -282,7 +296,8 @@ export default function activate(host: ServerHost) {
         }
         return;
       }
-      const root = await rootFor(ctx.key);
+      const start = await rootForInfo(ctx.key);
+      const root = start.root;
       if (!root) { err("Not a git repository"); return; }
       const descriptor = jobFor(msg);
       if (descriptor && activeJobs.has(ctx.key)) {
@@ -409,11 +424,17 @@ export default function activate(host: ServerHost) {
         let out: { snapshot: GitSnapshot; raw: string };
         try {
           out = await git.statusWithRaw(root);
-          lastStatusOut.set(ctx.key, out.raw + "\u0000" + opKey(out.snapshot.operation));
-          latestStatus.set(ctx.key, out.snapshot);
-          ctx.push({ type: "git:status", tabId: ctx.key, snapshot: out.snapshot });
+          // Discard the refresh snapshot when the workspace root changed while
+          // the request was in flight (same race as the poll path); the next
+          // poll recomputes against the current root.
+          const latest = await rootForInfo(ctx.key);
+          if (latest.root === start.root && latest.real === start.real && latest.gitIdent === start.gitIdent) {
+            lastStatusOut.set(ctx.key, out.raw + "\u0000" + opKey(out.snapshot.operation));
+            latestStatus.set(ctx.key, out.snapshot);
+            ctx.push({ type: "git:status", tabId: ctx.key, snapshot: out.snapshot });
+          }
         } catch { /* keep last */ }
-        if (refsChanged) { const refs = await refsMsg(ctx.key, SUBMODULE_MUTATIONS.has(msg.type)); if (refs) ctx.push(refs); }
+        if (refsChanged) { const refs = await refsMsg(ctx.key, TREE_CHANGING_MUTATIONS.has(msg.type)); if (refs) ctx.push(refs); }
         }
         if (descriptor) {
           activeJobs.delete(ctx.key);
