@@ -1,5 +1,5 @@
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
-import { mkdtemp, mkdir, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "bun";
@@ -286,5 +286,40 @@ describe("git module: root cache detects repository-boundary changes", () => {
     expect(refsMsg.refs.branches.map((b: any) => b.name).sort()).toEqual([]);
     expect(refsMsg.refs.submodules).toEqual([]);
     await rm(parent, { recursive: true, force: true });
+  });
+
+  test("symlink retarget re-resolves the root and does not leak submodules", async () => {
+    const d1 = await makeRepo();
+    const lib = await makeRepo();
+    await git(d1, "-c", "protocol.file.allow=always", "submodule", "add", lib, "vendor/lib");
+    await git(d1, "commit", "-q", "-m", "add submodule");
+    const d2 = await mkdtemp(join(tmpdir(), "tabterm-retarget-"));
+    await git(d2, "init", "-q", "-b", "main"); // fresh repo, no commits
+    const linkDir = await mkdtemp(join(tmpdir(), "tabterm-linkdir-"));
+    const link = join(linkDir, "repo");
+    await symlink(d1, link);
+    const { host, spec } = fakeHost({ tab1: link });
+    activate(host);
+    const { peer } = captureSends();
+    // Eager join caches d1's submodule list against real = d1.
+    await spec().onJoin!(ctxFor("tab1"), peer);
+
+    // Retarget the cwd symlink to a different repository while the room is
+    // active; the next polls must switch roots and never reuse d1's list.
+    await rm(link);
+    await symlink(d2, link);
+    const pushed: any[] = [];
+    const ctx = ctxFor("tab1", pushed);
+    for (let i = 0; i < 3; i++) await spec().poll!(ctx);
+    const status = pushed.find((m) => m.type === "git:status");
+    expect(status).toBeDefined();
+    expect(status.snapshot.headSha).toBeNull(); // new target has no commits
+    const refsMsg = pushed.find((m) => m.type === "git:refs");
+    expect(refsMsg).toBeDefined();
+    expect(refsMsg.refs.submodules).toEqual([]);
+    await rm(d1, { recursive: true, force: true });
+    await rm(d2, { recursive: true, force: true });
+    await rm(linkDir, { recursive: true, force: true });
+    await rm(lib, { recursive: true, force: true });
   });
 });

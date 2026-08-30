@@ -40,14 +40,12 @@ async function dirExists(p: string): Promise<boolean> {
 // Paths are compared in realpath space: resolveRoot returns a realpath'd root,
 // and symlinked cwds (e.g. /tmp → /private/tmp on macOS) otherwise never meet
 // it as a string prefix.
-async function rootCacheValid(entry: { cwd: string; root: string | null }): Promise<boolean> {
-  let start: string;
-  try { start = await pathRealpath(entry.cwd); } catch { return false; }
-  let p = start;
+async function rootCacheValid(entry: { cwd: string; root: string | null }, real: string): Promise<boolean> {
+  let p = real;
   // resolveRoot returns the caller's original cwd form when the cwd itself is
   // the toplevel (server/git.ts) — a symlinked cwd stays in symlink form. Its
   // realpath IS the repository root, so compare both in the same space.
-  const stop = entry.root !== null && entry.root === entry.cwd ? start : entry.root;
+  const stop = entry.root !== null && entry.root === entry.cwd ? real : entry.root;
   for (;;) {
     if (await dirExists(joinPath(p, ".git"))) return stop !== null && p === stop;
     if (stop !== null && p === stop) return false;   // root reached without its marker
@@ -72,27 +70,35 @@ export default function activate(host: ServerHost) {
   const activeJobs = new Map<string, GitJob>();
   // Resolved roots are stable for a workspace cwd. Resolving spawns
   // `git rev-parse --show-toplevel` (~30ms), so cache and re-resolve only when
-  // the cwd moves, the cached root disappears, or a `.git` marker appears
-  // closer to the cwd (e.g. `git init` from a terminal).
-  const rootCache = new Map<string, { cwd: string; root: string | null }>();
-  // Last successful submodule list per workspace, keyed with the root it was
-  // resolved against and reused on throttled ticks so a `git:refs` push never
-  // resets the sidebar to an empty submodule list — and never leaks the
-  // previous repository's list across a root switch.
-  const cachedSubmodules = new Map<string, { root: string; submodules: Submodule[] }>();
+  // the cwd moves, the realpath target changes (symlink retarget), the cached
+  // root disappears, or a `.git` marker appears closer to the cwd (e.g.
+  // `git init` from a terminal). `real` pins the resolved target so a
+  // symlinked cwd retargeted mid-session cannot pass an old cache entry.
+  const rootCache = new Map<string, { cwd: string; root: string | null; real: string }>();
+  // Last successful submodule list per workspace, keyed with the root AND its
+  // realpath target it was resolved against and reused on throttled ticks so a
+  // `git:refs` push never resets the sidebar to an empty submodule list — and
+  // never leaks a previous repository's list across a root switch or symlink
+  // retarget.
+  const cachedSubmodules = new Map<string, { root: string; real: string; submodules: Submodule[] }>();
 
-  const rootFor = async (key: string): Promise<string | null> => {
+  const rootForInfo = async (key: string): Promise<{ root: string | null; real: string }> => {
     const cwd = host.workspaces.get(key)?.cwd;
-    if (!cwd) { rootCache.delete(key); return null; }
+    if (!cwd) { rootCache.delete(key); return { root: null, real: "" }; }
+    let real: string;
+    try { real = await pathRealpath(cwd); } catch { rootCache.delete(key); return { root: null, real: "" }; }
     const entry = rootCache.get(key);
-    if (entry && entry.cwd === cwd && await rootCacheValid(entry)) return entry.root;
+    if (entry && entry.cwd === cwd && entry.real === real && await rootCacheValid(entry, real)) return { root: entry.root, real };
     const root = await git.resolveRoot(cwd);
-    rootCache.set(key, { cwd, root });
-    return root;
+    rootCache.set(key, { cwd, root, real });
+    return { root, real };
   };
 
+  const rootFor = async (key: string): Promise<string | null> => (await rootForInfo(key)).root;
+
   async function refsMsg(key: string, includeSubmodules = false) {
-    const root = await rootFor(key);
+    const start = await rootForInfo(key);
+    const root = start.root;
     if (!root) return { type: "git:refs", tabId: key, refs: emptyRefs() };
     try {
       const [all, remotes, stashes, worktrees] = await Promise.all([
@@ -104,20 +110,23 @@ export default function activate(host: ServerHost) {
         submodules = await git.submodules(root);
       } else {
         // Throttled ticks reuse the last successful list — but only for the
-        // same root, so a repository-boundary change (e.g. a nested `git init`)
-        // never broadcasts the previous repository's submodules.
+        // same root AND realpath target, so a repository-boundary change
+        // (e.g. a nested `git init`) or symlink retarget never broadcasts the
+        // previous repository's submodules.
         const cached = cachedSubmodules.get(key);
-        submodules = cached && cached.root === root ? cached.submodules : [];
+        submodules = cached && cached.root === root && cached.real === start.real ? cached.submodules : [];
       }
       // Revalidate AFTER every awaited subprocess — a repository boundary may
-      // have changed (e.g. a terminal `git init`) while any of them was
-      // running, including the slow `git submodule status`. Discard the result
-      // instead of caching/broadcasting the superseded root's refs; the next
-      // refs tick recomputes against the new root.
-      if ((await rootFor(key)) !== root) return null;
+      // have changed (e.g. a terminal `git init`) or the cwd symlink been
+      // retargeted while any of them was running, including the slow
+      // `git submodule status`. Discard the result instead of
+      // caching/broadcasting the superseded root's refs; the next refs tick
+      // recomputes against the new root.
+      const latest = await rootForInfo(key);
+      if (latest.root !== start.root || latest.real !== start.real) return null;
       const current = all.branches.find((b) => b.current)?.name ?? null;
       const refs: GitRefs = { branches: all.branches, remoteBranches: all.remoteBranches, current, remotes, stashes, tags: all.tags, submodules, worktrees };
-      if (due) cachedSubmodules.set(key, { root, submodules });
+      if (due) cachedSubmodules.set(key, { root, real: start.real, submodules });
       return { type: "git:refs", tabId: key, refs };
     } catch (e) {
       return { type: "git:error", tabId: key, message: `Unable to refresh refs: ${(e as Error).message}` };
@@ -179,7 +188,7 @@ export default function activate(host: ServerHost) {
         try {
           rootCache.delete(ctx.key); // may have cached "no repo" for this cwd
           const root = await git.initRepository(cwd);
-          rootCache.set(ctx.key, { cwd, root });
+          rootCache.set(ctx.key, { cwd, root, real: await pathRealpath(cwd) });
           const out = await git.statusWithRaw(root);
           lastStatusOut.set(ctx.key, out.raw + "\u0000" + opKey(out.snapshot.operation));
           latestStatus.set(ctx.key, out.snapshot);
