@@ -199,6 +199,7 @@ export default function activate(host: ServerHost) {
     const gen = (refsGen.get(key) ?? 0) + 1;
     refsGen.set(key, gen);
     const isEager = includeSubmodules;
+    const eagerAtStart = eagerGen.get(key) ?? 0;
     if (isEager) eagerGen.set(key, gen);
     const start = await rootForInfo(key);
     const root = start.root;
@@ -241,9 +242,11 @@ export default function activate(host: ServerHost) {
       // A newer refresh started while this one was running. Eager refreshes
       // (joins, tree-changing mutations) have priority: only a newer EAGER
       // supersedes one, while a background tick is superseded by any newer
-      // refresh — otherwise a tick overlapping a mutation's eager refresh
-      // would broadcast mixed data and discard the fresh eager result.
-      if (isEager ? (eagerGen.get(key) !== gen) : (refsGen.get(key) !== gen)) return null;
+      // refresh OR by an eager reservation made after it started (a
+      // tree-changing mutation reserving the eager generation early, before
+      // its post-mutation status await) — otherwise a tick overlapping the
+      // mutation would broadcast mixed data.
+      if (isEager ? (eagerGen.get(key) !== gen) : (refsGen.get(key) !== gen || (eagerGen.get(key) ?? 0) !== eagerAtStart)) return null;
       const current = all.branches.find((b) => b.current)?.name ?? null;
       const refs: GitRefs = { branches: all.branches, remoteBranches: all.remoteBranches, current, remotes, stashes, tags: all.tags, submodules, worktrees };
       if (due) cachedSubmodules.set(key, { root, real: start.real, gitIdent: start.gitIdent, submodules, eagerGen: eagerGen.get(key) ?? 0 });
@@ -389,12 +392,12 @@ export default function activate(host: ServerHost) {
           case "git:discard": refresh = true; await git.discard(root, msg.paths); break;
           case "git:ignore": refresh = true; await git.ignore(root, msg.paths); break;
           case "git:resolveConflict":
-            refresh = true;
+            refresh = true; refsChanged = true; // a resolved .gitmodules may change the submodule list
             if (msg.delete) await git.deleteConflictResolution(root, msg.path);
             else await git.saveConflictResolution(root, msg.path, msg.content);
             break;
           case "git:resolveConflictSide":
-            refresh = true;
+            refresh = true; refsChanged = true;
             if (msg.side !== "ours" && msg.side !== "theirs") throw new Error("Invalid conflict side.");
             await git.chooseConflictSide(root, msg.path, msg.side);
             break;

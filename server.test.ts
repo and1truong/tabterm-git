@@ -629,6 +629,36 @@ describe("git module: root cache detects repository-boundary changes", () => {
     await rm(lib, { recursive: true, force: true });
   });
 
+  test("resolving a .gitmodules conflict triggers an eager refs refresh", async () => {
+    const repo = await makeRepo();
+    const lib = await makeRepo();
+    await git(repo, "-c", "protocol.file.allow=always", "submodule", "add", lib, "vendor/lib");
+    await git(repo, "commit", "-q", "-m", "add submodule");
+    await git(repo, "checkout", "-q", "-b", "tweak");
+    const gm = await readFile(join(repo, ".gitmodules"), "utf8");
+    await writeFile(join(repo, ".gitmodules"), gm + "# tweak\n");
+    await git(repo, "add", ".gitmodules");
+    await git(repo, "commit", "-q", "-m", "tweak modules");
+    await git(repo, "checkout", "-q", "main");
+    await run(repo, ["merge", "tweak"]); // conflicts on .gitmodules
+    const { host, spec } = fakeHost({ tab1: repo });
+    activate(host);
+    const { peer } = captureSends();
+    await spec().onJoin!(ctxFor("tab1"), peer);
+
+    // Resolving the conflict rewrites .gitmodules (possible submodule-list
+    // change); the mutation must run its eager refs refresh, not just leave a
+    // dangling eager reservation that starves background ticks.
+    const pushed: any[] = [];
+    const ctx = ctxFor("tab1", pushed);
+    await spec().onRequest!(ctx, { type: "git:resolveConflict", tabId: "tab1", path: ".gitmodules", content: gm + "# resolved\n", delete: false }, peer);
+    const refsMsgs = pushed.filter((m) => m.type === "git:refs");
+    expect(refsMsgs.length).toBeGreaterThanOrEqual(1);
+    expect(refsMsgs.at(-1)!.refs.submodules).toHaveLength(1); // list of the resolved .gitmodules
+    await rm(repo, { recursive: true, force: true });
+    await rm(lib, { recursive: true, force: true });
+  });
+
   test("a poll discards a status snapshot for a superseded root", async () => {
     const parent = await makeRepo();
     const work = join(parent, "inner");
