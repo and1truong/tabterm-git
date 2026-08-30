@@ -21,6 +21,7 @@ const TREE_CHANGING_MUTATIONS = new Set([
   "git:checkout", "git:checkoutRemote", "git:pull", "git:merge", "git:rebase", "git:interactiveRebase",
   "git:cherry-pick", "git:revert", "git:reset", "git:operationAction", "git:bisect",
   "git:stashCreate", "git:stashApply", "git:resolveConflict", "git:resolveConflictSide",
+  "git:branchCreate", // checkout: true runs `git checkout -b` and switches the tree
   "git:submoduleUpdate", "git:submoduleUpdateRemote", "git:subtreeSync",
 ]);
 

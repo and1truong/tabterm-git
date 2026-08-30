@@ -500,6 +500,30 @@ describe("git module: root cache detects repository-boundary changes", () => {
     await rm(lib, { recursive: true, force: true });
   });
 
+  test("branch creation that checks out a base eagerly refreshes the submodule list", async () => {
+    const repo = await makeRepo();
+    await git(repo, "checkout", "-q", "-b", "nosub"); // branch WITHOUT the submodule
+    await git(repo, "checkout", "-q", "main");
+    const lib = await makeRepo();
+    await git(repo, "-c", "protocol.file.allow=always", "submodule", "add", lib, "vendor/lib");
+    await git(repo, "commit", "-q", "-m", "add submodule");
+    const { host, spec } = fakeHost({ tab1: repo });
+    activate(host);
+    const { peer } = captureSends();
+    await spec().onJoin!(ctxFor("tab1"), peer);
+
+    // branchCreate with checkout: true switches the tree to the base branch's
+    // state (git checkout -b ...), so the refs push must refresh submodules
+    // eagerly instead of reusing the cached list.
+    const pushed: any[] = [];
+    await spec().onRequest!(ctxFor("tab1", pushed), { type: "git:branchCreate", tabId: "tab1", name: "feature", from: "nosub", checkout: true }, peer);
+    const refsMsg = pushed.find((m) => m.type === "git:refs");
+    expect(refsMsg).toBeDefined();
+    expect(refsMsg.refs.submodules).toEqual([]);
+    await rm(repo, { recursive: true, force: true });
+    await rm(lib, { recursive: true, force: true });
+  });
+
   test("a poll discards a status snapshot for a superseded root", async () => {
     const parent = await makeRepo();
     const work = join(parent, "inner");
