@@ -2,7 +2,7 @@ import type { ServerHost, RoomContext, Peer } from "@tabterm/module-host/server"
 import * as git from "./server/git.ts";
 import type { GitSnapshot, GitRefs, GitJob, GitOperation, Submodule } from "./shared.ts";
 import { stat as pathStat, realpath as pathRealpath, readFile as pathReadFile } from "node:fs/promises";
-import { dirname as pathDirname, join as joinPath } from "node:path";
+import { dirname as pathDirname, join as joinPath, resolve as pathResolve } from "node:path";
 import { subtreeMigrations } from "./server/subtreeMigrations.ts";
 import { makeSubtreeDb } from "./server/subtreeDb.ts";
 import { makeSubtreeService } from "./server/subtreeService.ts";
@@ -33,9 +33,10 @@ function opKey(op: GitOperation | null): string {
 //   - directory marker: birthtime (creation time) is monotonic and immutable
 //     across normal git activity inside an existing .git (ctime of the
 //     directory changes on every entry write, so it is not used);
-//   - regular-file gitfile (linked worktrees / submodules): an in-place
-//     rewrite preserving dev/ino/birthtime is caught by hashing the file's
-//     contents (the gitdir target).
+//   - regular-file gitfile (linked worktrees / submodules): content hash
+//     catches in-place pointer rewrites; the resolved gitdir target's own
+//     identity catches replacing/retargeting the target behind an unchanged
+//     pointer.
 function hashString(s: string): number {
   let h = 2166136261;
   for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); }
@@ -48,7 +49,25 @@ async function pathIdentity(p: string): Promise<string | null> {
     if (st.isDirectory()) {
       return `d:${st.dev}:${st.ino}:${st.birthtimeMs || st.ctimeMs}`;
     }
+    // Regular file: a .git gitfile (linked worktrees / submodules) pointing at
+    // the real gitdir. In-place rewrites of the pointer are caught by the
+    // content hash, and replacing/retargeting the gitdir BEHIND an unchanged
+    // pointer (e.g. swapping the worktree admin dir for a symlink to another
+    // repo's) is caught by resolving the target and folding its filesystem
+    // identity in (realpath follows the swap, so the identities diverge).
     const content = await pathReadFile(p, "utf8");
+    const m = content.match(/^gitdir:\s*(.+?)\s*$/m);
+    if (m) {
+      // gitfile paths are relative to the directory containing the .git file.
+      const target = pathResolve(pathDirname(p), m[1]!);
+      const resolved = await pathRealpath(target).catch(() => null);
+      if (resolved) {
+        try {
+          const tst = await pathStat(resolved);
+          return `f:${st.dev}:${st.ino}:${st.birthtimeMs || st.ctimeMs}:${hashString(content)}:${tst.dev}:${tst.ino}:${tst.birthtimeMs || tst.ctimeMs}`;
+        } catch { /* fall through to pointer-only identity */ }
+      }
+    }
     return `f:${st.dev}:${st.ino}:${st.birthtimeMs || st.ctimeMs}:${hashString(content)}`;
   } catch {
     return null;
