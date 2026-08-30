@@ -688,6 +688,31 @@ describe("git module: root cache detects repository-boundary changes", () => {
     await rm(lib, { recursive: true, force: true });
   });
 
+  test("a passive join finishing after a mutation reservation discards its result", async () => {
+    const repo = await makeRepo();
+    const lib = await makeRepo();
+    await git(repo, "-c", "protocol.file.allow=always", "submodule", "add", lib, "vendor/lib");
+    await git(repo, "commit", "-q", "-m", "add submodule");
+    const { host, spec } = fakeHost({ tab1: repo });
+    activate(host);
+    await spec().onJoin!(ctxFor("tab1"), captureSends().peer);
+    const { peer, sent } = captureSends();
+
+    // A second peer joins before a stash mutation (tree-changing; its eager
+    // generation is reserved right after the mutation completes). The join's
+    // own refresh finishes after the reservation: it must discard — neither
+    // deliver pre-mutation refs to the joining peer nor tag the stale
+    // submodule cache with the new eager generation.
+    const joinP = spec().onJoin!(ctxFor("tab1"), peer);
+    const ctx = ctxFor("tab1");
+    await spec().onRequest!(ctx, { type: "git:stashCreate", tabId: "tab1", message: "wip", options: {} }, captureSends().peer);
+    await joinP;
+    // The join's refs (computed pre-mutation) must not reach the joining peer.
+    expect(sent.filter((m) => m.type === "git:refs")).toEqual([]);
+    await rm(repo, { recursive: true, force: true });
+    await rm(lib, { recursive: true, force: true });
+  });
+
   test("a poll discards a status snapshot for a superseded root", async () => {
     const parent = await makeRepo();
     const work = join(parent, "inner");

@@ -199,17 +199,30 @@ export default function activate(host: ServerHost) {
   // result is known to be current, so the guarded check and the push happen in
   // the same synchronous block — an awaiting caller could otherwise resume
   // after a mutation reservation landed and push superseded data. `passive` is
-  // for peer-scoped join refreshes: they must not bump (or be invalidated by)
-  // the shared generations, or an overlapping mutation eager refresh would be
-  // discarded while its result only reaches the joining peer.
+  // for peer-scoped join refreshes: they capture but do not advance the shared
+  // generations (a join must not supersede a pending room broadcast, and
+  // overlapping joins must not invalidate each other), yet they still discard
+  // their result when an authoritative refresh changed the generations or the
+  // repository identity after they started — otherwise a join finishing after
+  // a mutation would deliver pre-mutation refs and tag the stale submodule
+  // list with the new eager generation.
   async function refsMsg(key: string, includeSubmodules: boolean, push: (msg: unknown) => void, passive = false): Promise<void> {
     const gen = (refsGen.get(key) ?? 0) + 1;
     const isEager = includeSubmodules;
+    const genAtStart = refsGen.get(key) ?? 0;
     const eagerAtStart = eagerGen.get(key) ?? 0;
     if (!passive) {
       refsGen.set(key, gen);
       if (isEager) eagerGen.set(key, gen);
     }
+    // True when a newer refresh (or, for eager results, a newer eager or
+    // reservation; for background ticks, any newer refresh or reservation)
+    // started after this one — or, for passive joins, when the eager
+    // generation advanced after they started.
+    const superseded = (): boolean => {
+      if (isEager) return passive ? (eagerGen.get(key) ?? 0) !== eagerAtStart : eagerGen.get(key) !== gen;
+      return (refsGen.get(key) !== (passive ? genAtStart : gen)) || (eagerGen.get(key) ?? 0) !== eagerAtStart;
+    };
     const start = await rootForInfo(key);
     const root = start.root;
     if (!root) { push({ type: "git:refs", tabId: key, refs: emptyRefs() }); return; }
@@ -248,14 +261,7 @@ export default function activate(host: ServerHost) {
       // recomputes against the new root.
       const latest = await rootForInfo(key);
       if (latest.root !== start.root || latest.real !== start.real || latest.gitIdent !== start.gitIdent) return;
-      // A newer refresh started while this one was running. Eager refreshes
-      // (joins, tree-changing mutations) have priority: only a newer EAGER
-      // supersedes one, while a background tick is superseded by any newer
-      // refresh OR by an eager reservation made after it started (a
-      // tree-changing mutation reserving the eager generation early, before
-      // its post-mutation status await) — otherwise a tick overlapping the
-      // mutation would broadcast mixed data.
-      if (!passive && (isEager ? (eagerGen.get(key) !== gen) : (refsGen.get(key) !== gen || (eagerGen.get(key) ?? 0) !== eagerAtStart))) return;
+      if (superseded()) return;
       const current = all.branches.find((b) => b.current)?.name ?? null;
       const refs: GitRefs = { branches: all.branches, remoteBranches: all.remoteBranches, current, remotes, stashes, tags: all.tags, submodules, worktrees };
       if (due) cachedSubmodules.set(key, { root, real: start.real, gitIdent: start.gitIdent, submodules, eagerGen: eagerGen.get(key) ?? 0 });
@@ -263,11 +269,13 @@ export default function activate(host: ServerHost) {
       // between validation and delivery.
       push({ type: "git:refs", tabId: key, refs });
     } catch (e) {
-      // Superseded refreshes must not deliver their errors either: the client
+      // Superseded or old-root errors must not be delivered either: the client
       // stores git:error persistently and a later successful git:refs message
       // does not clear it, so an obsolete error would linger after the
       // authoritative refresh succeeded.
-      if (!passive && (isEager ? (eagerGen.get(key) !== gen) : (refsGen.get(key) !== gen || (eagerGen.get(key) ?? 0) !== eagerAtStart))) return;
+      if (superseded()) return;
+      const latest = await rootForInfo(key);
+      if (latest.root !== start.root || latest.real !== start.real || latest.gitIdent !== start.gitIdent) return;
       push({ type: "git:error", tabId: key, message: `Unable to refresh refs: ${(e as Error).message}` });
     }
   }
