@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { memo, useEffect, useState } from "react";
 import type { FileChange } from "../../shared.ts";
 import { CodeChip } from "./icons.tsx";
 
@@ -12,7 +12,7 @@ interface Props {
   onIgnore: (paths: string[]) => void;
 }
 
-export function ChangesPane(p: Props) {
+export const ChangesPane = memo(function ChangesPane(p: Props) {
   const [checked, setChecked] = useState<Set<string>>(() => new Set());
   const conflicts = p.unstaged.filter(f => f.code === "U");
   const unstaged = p.unstaged.filter(f => f.code !== "U");
@@ -76,7 +76,7 @@ export function ChangesPane(p: Props) {
       </Section>
     </div>
   );
-}
+});
 
 function Section({ title, actionLabel, onAction, children }: {
   title: string;

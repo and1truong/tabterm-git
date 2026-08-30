@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { memo, useMemo } from "react";
 import hljs from "highlight.js/lib/common";
 import type { DiffPayload, DiffHunk } from "../../shared.ts";
 import { serializeHunk, serializeSelectedLines } from "./patch.ts";
@@ -9,7 +9,7 @@ interface Props {
   onStageHunk?: (patch: string, path: string, staged: boolean) => void;
 }
 
-export function DiffView({ diff, onStageHunk }: Props) {
+export const DiffView = memo(function DiffView({ diff, onStageHunk }: Props) {
   const langHint = useMemo(() => guessLang(diff.path), [diff.path]);
   // Partial-patch normalization is forward-only. A staged replacement needs a
   // different reverse patch, so staged diffs intentionally unstage by hunk.
@@ -40,7 +40,7 @@ export function DiffView({ diff, onStageHunk }: Props) {
       </div>
     </div>
   );
-}
+});
 
 function Hunk({ h, langHint, action, onStage, onStageLine }: {
   h: DiffHunk;

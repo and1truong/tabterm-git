@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useCallback } from "react";
 import type { ClientHost } from "@tabterm/module-host/client";
 import type { GitSnapshot, GitRefs, GitJob, GitOperationType, ConflictPayload, CommitContext, GitLogPayload, ComparePayload, ReflogEntry, FileInsightPayload, RebasePlan, StashDiffPayload } from "../shared.ts";
 import { HostCtx } from "./useHost.ts";
@@ -17,6 +17,7 @@ import { RecoveryView } from "./git/RecoveryView.tsx";
 import { FileInsightView } from "./git/FileInsightView.tsx";
 import { RebasePlanView } from "./git/RebasePlanView.tsx";
 import { StashView } from "./git/StashView.tsx";
+import type { CommitDraft } from "./git/CommitComposer.tsx";
 import Notice from "./Notice.tsx";
 
 type ManageTab = "remotes" | "submodules" | "subtrees" | "worktrees";
@@ -54,11 +55,44 @@ export function GitPanel({ tabId, host }: { tabId: string; host: ClientHost }) {
   snapshotRef.current = snapshot;
   const ready = !!snapshot;
 
-  const send = (msg: Record<string, unknown>) => host.send(msg);
-  const clearError = () => host.store.setState((s) => ({
+  // Handlers are memoized so the memo()ed children below (ChangesPane,
+  // DiffView, RefsColumn, HistoryView, CommitComposer) skip re-rendering when
+  // a poll/refs update doesn't touch their props. Snapshot reads go through
+  // snapshotRef so onSelect stays referentially stable across polls.
+  const send = useCallback((msg: Record<string, unknown>) => host.send(msg), [host]);
+  const clearError = useCallback(() => host.store.setState((s) => ({
     ...s,
     gitError: { ...(s.gitError ?? {}), [tabId]: null },
-  }));
+  })), [tabId]);
+  const stage = useCallback((paths: string[]) => send({ type: "git:stage", tabId, paths }), [send, tabId]);
+  const unstage = useCallback((paths: string[]) => send({ type: "git:unstage", tabId, paths }), [send, tabId]);
+  const onIgnore = useCallback((paths: string[]) => send({ type: "git:ignore", tabId, paths }), [send, tabId]);
+  const onSelect = useCallback((path: string, staged: boolean) => {
+    setSelected({ path, staged });
+    setDiscardConfirming(false);
+    panelRef.current?.focus();
+    const snap = snapshotRef.current;
+    const isConflict = !staged && !!snap && snap.files.some(f => f.path === path && f.code === "U");
+    send({ type: isConflict ? "git:openConflict" : "git:openDiff", tabId, path, staged });
+  }, [send, tabId]);
+  const onStageHunk = useCallback((patch: string, path: string, staged: boolean) => {
+    send({ type: "git:stageHunk", tabId, path, staged, patch });
+  }, [send, tabId]);
+  const onOpenCommit = useCallback((sha: string) => send({ type: "git:openCommitDiff", tabId, sha }), [send, tabId]);
+  const onLoadMore = useCallback(() => {
+    if (log) send({ type: "git:openHistory", tabId, limit: log.limit + 200, all: true });
+  }, [send, tabId, log]);
+  const onAction = useCallback((action: "cherry-pick" | "revert" | "bisect-start", sha: string) => {
+    if (action === "bisect-start") send({ type: "git:bisect", tabId, action: "start", good: sha, bad: "HEAD" });
+    else send({ type: `git:${action}`, tabId, sha });
+  }, [send, tabId]);
+  const onDraftChange = useCallback((draft: CommitDraft) => host.kv.set(`commitDraft:${tabId}`, draft), [host, tabId]);
+  const onCommit = useCallback((message: string, amend: boolean, signoff: boolean, sign: boolean) => {
+    send({ type: "git:commit", tabId, message, amend, signoff, sign });
+  }, [send, tabId]);
+  const onManage = useCallback((tab: ManageTab) => setManageOpen(tab), []);
+  const onNewTag = useCallback(() => setTagCreateOpen(true), []);
+  const onNewBranch = useCallback(() => setBranchCreateOpen(true), []);
 
   useEffect(() => {
     host.send({ type: "git:subscribe", tabId });
@@ -160,16 +194,6 @@ export function GitPanel({ tabId, host }: { tabId: string; host: ClientHost }) {
     return <div className="flex-1 float-card flex items-center justify-center text-[var(--faint)] text-sm">Reading repository…</div>;
   }
 
-  const stage   = (paths: string[]) => send({ type: "git:stage",   tabId, paths });
-  const unstage = (paths: string[]) => send({ type: "git:unstage", tabId, paths });
-  const onSelect = (path: string, staged: boolean) => {
-    setSelected({ path, staged });
-    setDiscardConfirming(false);
-    panelRef.current?.focus();
-    const isConflict = !staged && snapshot.files.some(f => f.path === path && f.code === "U");
-    send({ type: isConflict ? "git:openConflict" : "git:openDiff", tabId, path, staged });
-  };
-
   return (
     <HostCtx.Provider value={host}>
       <div ref={panelRef} tabIndex={-1} className="flex-1 flex flex-col min-h-0 float-card overflow-hidden outline-none">
@@ -227,7 +251,7 @@ export function GitPanel({ tabId, host }: { tabId: string; host: ClientHost }) {
         {activeTab === "changes" ? (
           <>
             <div className="flex-1 flex min-h-0">
-              <RefsColumn refs={refs} tabId={tabId} onManage={(tab) => setManageOpen(tab)} onNewTag={() => setTagCreateOpen(true)} onNewBranch={() => setBranchCreateOpen(true)} />
+              <RefsColumn refs={refs} tabId={tabId} onManage={onManage} onNewTag={onNewTag} onNewBranch={onNewBranch} />
               <ChangesPane
                 unstaged={snapshot.files}
                 staged={snapshot.staged}
@@ -235,7 +259,7 @@ export function GitPanel({ tabId, host }: { tabId: string; host: ClientHost }) {
                 onSelect={onSelect}
                 onStage={stage}
                 onUnstage={unstage}
-                onIgnore={(paths) => send({ type: "git:ignore", tabId, paths })}
+                onIgnore={onIgnore}
               />
               <div className="flex-1 flex flex-col min-w-0">
                 {selected && snapshot.files.some(f => f.path === selected.path && f.code === "U") ? (
@@ -273,7 +297,7 @@ export function GitPanel({ tabId, host }: { tabId: string; host: ClientHost }) {
                     </div>
                     <DiffView
                       diff={diff as any}
-                      onStageHunk={(patch, path, staged) => send({ type: "git:stageHunk", tabId, path, staged, patch })}
+                      onStageHunk={onStageHunk}
                     />
                   </>
                 ) : (
@@ -289,8 +313,8 @@ export function GitPanel({ tabId, host }: { tabId: string; host: ClientHost }) {
               stagedCount={snapshot.staged.length}
               branchLabel={snapshot.branch ?? snapshot.headSha ?? "—"}
               headSha={snapshot.headSha}
-              onDraftChange={(draft) => host.kv.set(`commitDraft:${tabId}`, draft)}
-              onCommit={(message, amend, signoff, sign) => send({ type: "git:commit", tabId, message, amend, signoff, sign })}
+              onDraftChange={onDraftChange}
+              onCommit={onCommit}
             />
           </>
         ) : activeTab === "history" ? (
@@ -299,11 +323,9 @@ export function GitPanel({ tabId, host }: { tabId: string; host: ClientHost }) {
             requestedSha={historySelection}
             hasMore={log.hasMore}
             commitDiff={commitDiff as any}
-            onOpenCommit={(sha) => send({ type: "git:openCommitDiff", tabId, sha })}
-            onLoadMore={() => send({ type: "git:openHistory", tabId, limit: log.limit + 200, all: true })}
-            onAction={(action, sha) => action === "bisect-start"
-              ? send({ type: "git:bisect", tabId, action: "start", good: sha, bad: "HEAD" })
-              : send({ type: `git:${action}`, tabId, sha })}
+            onOpenCommit={onOpenCommit}
+            onLoadMore={onLoadMore}
+            onAction={onAction}
           /> : (
             <div className="grid place-items-center flex-1 text-[var(--faint)] text-sm">Loading…</div>
           )
