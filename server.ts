@@ -195,7 +195,11 @@ export default function activate(host: ServerHost) {
 
   const rootFor = async (key: string): Promise<string | null> => (await rootForInfo(key)).root;
 
-  async function refsMsg(key: string, includeSubmodules = false) {
+  // Pushes the refs message itself (or the error/empty messages) once the
+  // result is known to be current, so the guarded check and the push happen in
+  // the same synchronous block — an awaiting caller could otherwise resume
+  // after a mutation reservation landed and push superseded data.
+  async function refsMsg(key: string, includeSubmodules: boolean, push: (msg: unknown) => void): Promise<void> {
     const gen = (refsGen.get(key) ?? 0) + 1;
     refsGen.set(key, gen);
     const isEager = includeSubmodules;
@@ -203,7 +207,7 @@ export default function activate(host: ServerHost) {
     if (isEager) eagerGen.set(key, gen);
     const start = await rootForInfo(key);
     const root = start.root;
-    if (!root) return { type: "git:refs", tabId: key, refs: emptyRefs() };
+    if (!root) { push({ type: "git:refs", tabId: key, refs: emptyRefs() }); return; }
     try {
       const [all, remotes, stashes, worktrees] = await Promise.all([
         git.refsOf(root), git.remotes(root), git.stashes(root), git.worktrees(root),
@@ -226,7 +230,7 @@ export default function activate(host: ServerHost) {
         if (cacheSafe && cached!.eagerGen === (eagerGen.get(key) ?? 0)) {
           submodules = cached!.submodules;
         } else if (cacheSafe) {
-          return null;
+          return;
         } else {
           submodules = [];
         }
@@ -238,7 +242,7 @@ export default function activate(host: ServerHost) {
       // caching/broadcasting the superseded root's refs; the next refs tick
       // recomputes against the new root.
       const latest = await rootForInfo(key);
-      if (latest.root !== start.root || latest.real !== start.real || latest.gitIdent !== start.gitIdent) return null;
+      if (latest.root !== start.root || latest.real !== start.real || latest.gitIdent !== start.gitIdent) return;
       // A newer refresh started while this one was running. Eager refreshes
       // (joins, tree-changing mutations) have priority: only a newer EAGER
       // supersedes one, while a background tick is superseded by any newer
@@ -246,13 +250,15 @@ export default function activate(host: ServerHost) {
       // tree-changing mutation reserving the eager generation early, before
       // its post-mutation status await) — otherwise a tick overlapping the
       // mutation would broadcast mixed data.
-      if (isEager ? (eagerGen.get(key) !== gen) : (refsGen.get(key) !== gen || (eagerGen.get(key) ?? 0) !== eagerAtStart)) return null;
+      if (isEager ? (eagerGen.get(key) !== gen) : (refsGen.get(key) !== gen || (eagerGen.get(key) ?? 0) !== eagerAtStart)) return;
       const current = all.branches.find((b) => b.current)?.name ?? null;
       const refs: GitRefs = { branches: all.branches, remoteBranches: all.remoteBranches, current, remotes, stashes, tags: all.tags, submodules, worktrees };
       if (due) cachedSubmodules.set(key, { root, real: start.real, gitIdent: start.gitIdent, submodules, eagerGen: eagerGen.get(key) ?? 0 });
-      return { type: "git:refs", tabId: key, refs };
+      // Check and push are synchronous here — the result cannot be superseded
+      // between validation and delivery.
+      push({ type: "git:refs", tabId: key, refs });
     } catch (e) {
-      return { type: "git:error", tabId: key, message: `Unable to refresh refs: ${(e as Error).message}` };
+      push({ type: "git:error", tabId: key, message: `Unable to refresh refs: ${(e as Error).message}` });
     }
   }
 
@@ -286,7 +292,7 @@ export default function activate(host: ServerHost) {
       }
       // Refs are independent of the working tree; push after status so a slow
       // refs refresh (submodule status) never delays the status message.
-      if (t % REFS_EVERY === 0) { const refs = await refsMsg(ctx.key); if (refs) ctx.push(refs); }
+      if (t % REFS_EVERY === 0) await refsMsg(ctx.key, false, (m) => ctx.push(m));
       return undefined;
     },
     onJoin: async (ctx: RoomContext, peer: Peer) => {
@@ -305,8 +311,7 @@ export default function activate(host: ServerHost) {
       }
       // A fresh join sees submodules immediately; the cadence only throttles
       // the background refreshes.
-      const refs = await refsMsg(ctx.key, true);
-      if (refs) peer.send(refs);
+      await refsMsg(ctx.key, true, (m) => peer.send(m));
     },
     onIdle: (key: string) => { latestStatus.delete(key); lastStatusOut.delete(key); refsTick.delete(key); activeJobs.delete(key); rootCache.delete(key); cachedSubmodules.delete(key); refsGen.delete(key); eagerGen.delete(key); },
     onRequest: async (ctx: RoomContext, msg: any, peer: Peer) => {
@@ -325,8 +330,7 @@ export default function activate(host: ServerHost) {
           latestStatus.set(ctx.key, out.snapshot);
           refsTick.set(ctx.key, 0);
           ctx.push({ type: "git:status", tabId: ctx.key, snapshot: out.snapshot });
-          const refs = await refsMsg(ctx.key);
-          if (refs) ctx.push(refs);
+          await refsMsg(ctx.key, false, (m) => ctx.push(m));
         } catch (e) {
           err((e as Error).message);
         }
@@ -478,7 +482,7 @@ export default function activate(host: ServerHost) {
             ctx.push({ type: "git:status", tabId: ctx.key, snapshot: out.snapshot });
           }
         } catch { /* keep last */ }
-        if (refsChanged) { const refs = await refsMsg(ctx.key, TREE_CHANGING_MUTATIONS.has(msg.type)); if (refs) ctx.push(refs); }
+        if (refsChanged) await refsMsg(ctx.key, TREE_CHANGING_MUTATIONS.has(msg.type), (m) => ctx.push(m));
         }
         if (descriptor) {
           activeJobs.delete(ctx.key);
