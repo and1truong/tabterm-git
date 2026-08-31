@@ -173,6 +173,10 @@ async function main() {
   flushSync(() => actionsButton.click());
   const checkoutButton = [...refsContainer.querySelectorAll("button")].find(button => button.textContent?.trim() === "Checkout");
   if (!checkoutButton) fail("branch action menu did not open");
+  const branchMenu = checkoutButton.parentElement;
+  if (!branchMenu) fail("branch action menu container was not rendered");
+  flushSync(() => branchMenu.dispatchEvent(new win.Event("scroll")));
+  if (!checkoutButton.isConnected) fail("branch action menu closed while scrolling its own overflow");
   flushSync(() => checkoutButton.click());
   if (branchMessages[0]?.type !== "git:checkout" || branchMessages[0]?.branch !== "feature") fail("branch checkout action sent the wrong payload");
 
